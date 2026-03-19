@@ -209,11 +209,30 @@ def run_universe(
          f"{prefix}_calendar", f"update: {label} calendar year returns")
 
     # Latest weights snapshot (for Streamlit "current allocation" card)
-    latest = port["latest_weights"].reset_index()
-    latest.columns = ["ticker", "weight"]
-    latest = latest[latest["weight"] > 0.001].sort_values("weight", ascending=False)
-    push(Dataset.from_list(latest.to_dict("records")),
+    latest_w = port["latest_weights"]
+    if isinstance(latest_w, pd.Series):
+        latest_w = latest_w.reset_index()
+        latest_w.columns = ["ticker", "weight"]
+    latest_w = latest_w[latest_w["weight"] > 0.001].sort_values("weight", ascending=False)
+    push(Dataset.from_list(latest_w.to_dict("records")),
          f"{prefix}_latest_weights", f"update: {label} latest weights")
+
+    # Rolling optimal params (period, n, best_ann_return over time)
+    opt_df = port["optimal_params"].reset_index()
+    opt_df["date"] = opt_df["date"].dt.strftime("%Y-%m-%d")
+    push(Dataset.from_pandas(opt_df, preserve_index=False),
+         f"{prefix}_optimal_params", f"update: {label} optimal params history")
+
+    # Latest optimal snapshot — single row for hero box in Streamlit
+    latest_opt = [{
+        "optimal_period":      port["latest_period"],
+        "optimal_n":           port["latest_n"],
+        "best_ann_return":     round(port["latest_best_return"], 6),
+        "holdings":            ",".join(latest_w["ticker"].tolist()),
+        "as_of":               str(prices.index[-1].date()),
+    }]
+    push(Dataset.from_list(latest_opt),
+         f"{prefix}_latest_optimal", f"update: {label} latest optimal snapshot")
 
     print(f"  ✓ {label} pipeline complete.")
     return bt["summary"]
@@ -226,7 +245,7 @@ def main():
         raise EnvironmentError("HF_TOKEN environment variable not set.")
 
     print("=" * 60)
-    print("TrendFolios — Weekly Pipeline Run")
+    print("TrendFolios — Daily Pipeline Run")
     print("=" * 60)
 
     # Load and update prices
