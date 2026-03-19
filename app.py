@@ -78,26 +78,25 @@ def load(config: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900)
-def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
+def load_holdings_and_config(key: str) -> tuple[pd.DataFrame, dict]:
     """
-    Two separate reliable sources:
-    - {prefix}_config.json  : plain JSON file in HF repo → config values
-    - {prefix}_weights      : large parquet dataset → current holdings (last row)
+    key = e.g. "equity_a", "equity_b", "fixed_income_a", "fixed_income_b"
+    - {key}_config.json  : plain JSON → config values
+    - {key}_weights      : large parquet → current holdings (last row)
     """
-    holdings       = pd.DataFrame(columns=["ticker", "weight"])
-    opt            = {}
-    inception_year = 2005 if prefix == "equity" else 2007
+    # Derive inception year from the universe part of the key
+    inception_year = 2005 if key.startswith("equity") else 2007
+    holdings = pd.DataFrame(columns=["ticker", "weight"])
+    opt      = {}
 
-    # ── Load config from JSON file ────────────────────────────────────────────
+    # ── Config from JSON ──────────────────────────────────────────────────────
     try:
         from huggingface_hub import hf_hub_download
-        json_path = hf_hub_download(
-            repo_id   = HF_REPO_ID,
-            filename  = f"{prefix}_config.json",
-            repo_type = "dataset",
-            token     = HF_TOKEN,
-        )
         import json
+        json_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename=f"{key}_config.json",
+            repo_type="dataset", token=HF_TOKEN,
+        )
         with open(json_path) as f:
             cfg = json.load(f)
         opt = {
@@ -111,13 +110,13 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
             "is_invested":     bool(cfg.get("is_invested", False)),
         }
     except Exception as e:
-        st.warning(f"Could not load {prefix}_config.json: {e}")
+        st.warning(f"Could not load {key}_config.json: {e}")
 
-    # ── Load holdings from last row of weights dataset ────────────────────────
+    # ── Holdings from weights dataset ────────────────────────────────────────
     try:
-        weights_df = load(f"{prefix}_weights")
+        weights_df = load(f"{key}_weights")
         if not weights_df.empty:
-            last = weights_df.iloc[-1]
+            last  = weights_df.iloc[-1]
             as_of = str(weights_df.index[-1].date())
             w = last.apply(pd.to_numeric, errors="coerce")
             w = w[w > 1e-6].sort_values(ascending=False)
@@ -128,10 +127,10 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
                 })
             if not opt:
                 opt["as_of"] = as_of
-            opt["optimal_n"] = len(holdings)
+            opt["optimal_n"]   = len(holdings)
             opt["is_invested"] = len(holdings) > 0
     except Exception as e:
-        st.warning(f"Could not load {prefix}_weights: {e}")
+        st.warning(f"Could not load {key}_weights: {e}")
 
     return holdings, opt
 
@@ -249,199 +248,190 @@ with st.sidebar:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-prefix      = "equity"       if universe == "Equity" else "fixed_income"
-bench_label = "SPY"          if universe == "Equity" else "AGG"
+prefix      = "equity"  if universe == "Equity" else "fixed_income"
+bench_label = "SPY"     if universe == "Equity" else "AGG"
 today_label = pd.Timestamp.today().strftime("%d %b %Y")
 
 st.title(f"TrendFolios® — {universe} Strategy")
-st.caption(
-    f"Benchmark: {bench_label} | "
-    "Rolling optimised holding period & portfolio size | Fee: 0.55% p.a."
-)
+st.caption(f"Benchmark: {bench_label} | Fee: 0.55% p.a.")
 
-# Load all data
-with st.spinner("Loading …"):
-    try:
-        rolling_df          = load(f"{prefix}_rolling")
-        summary_df          = load(f"{prefix}_summary")
-        calendar_df         = load(f"{prefix}_calendar")
-        latest_wts, latest_opt = load_holdings_and_config(prefix)
-        data_loaded         = True
-    except Exception as e:
-        st.error(f"Could not load data: {e}")
-        st.info("Run the seed script and daily pipeline first.")
-        data_loaded = False
+# ── Option tabs ────────────────────────────────────────────────────────────────
+tab_a, tab_b = st.tabs([
+    "📊 Option A — TrendFolios Base",
+    "🚀 Option B — Enhanced (Regime + Dual Momentum + Vol Target)",
+])
 
-if not data_loaded:
-    st.stop()
+# ─────────────────────────────────────────────────────────────────────────────
+def render_option(key: str, option_label: str, bench_label: str,
+                  today_label: str, inception_year: int):
+    """Render the full dashboard for one option."""
 
-# ════════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — WHAT TO HOLD TODAY  (most prominent)
-# ════════════════════════════════════════════════════════════════════════════════
+    with st.spinner(f"Loading {option_label} …"):
+        try:
+            rolling_df          = load(f"{key}_rolling")
+            summary_df          = load(f"{key}_summary")
+            calendar_df         = load(f"{key}_calendar")
+            latest_wts, latest_opt = load_holdings_and_config(key)
+            data_loaded         = True
+        except Exception as e:
+            st.error(f"Could not load {option_label} data: {e}")
+            st.info("Run the pipeline first.")
+            return
 
-st.markdown("---")
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _fmt_int(v, fallback="—"):
+        try:
+            i = int(float(v))
+            return str(i) if i > 0 else fallback
+        except Exception:
+            return fallback
 
-# Gather data — coerce types robustly from parquet round-trip
-def _safe(v, fmt=str, fallback="—"):
-    try:
-        return fmt(v) if v is not None and str(v) not in ("nan", "None", "", "0") else fallback
-    except Exception:
-        return fallback
+    def _fmt_pct(v, fallback="—"):
+        try:
+            f = float(v)
+            return f"{f*100:.2f}%" if not np.isnan(f) else fallback
+        except Exception:
+            return fallback
 
-opt_period   = latest_opt.get("optimal_period")
-opt_n        = latest_opt.get("optimal_n")
-target_n     = latest_opt.get("target_n", opt_n)
-best_ret     = latest_opt.get("best_ann_return")
-as_of        = latest_opt.get("as_of", "")
-raw_method   = latest_opt.get("optimal_method", "inv_te")
-method_label = "Inverse-TE weighting" if raw_method == "inv_te" else "Momentum-rank weighting"
-method_emoji = "⚖️" if raw_method == "inv_te" else "🚀"
+    opt_period   = latest_opt.get("optimal_period")
+    opt_n        = latest_opt.get("optimal_n")
+    target_n     = latest_opt.get("target_n", opt_n)
+    best_ret     = latest_opt.get("best_ann_return")
+    as_of        = latest_opt.get("as_of", "")
+    raw_method   = latest_opt.get("optimal_method", "inv_te")
+    inc_year     = latest_opt.get("inception_year", inception_year)
 
-def _fmt_int(v, fallback="—") -> str:
-    """Format an int value, showing fallback if None/0/nan."""
-    try:
-        i = int(float(v))
-        return str(i) if i > 0 else fallback
-    except Exception:
-        return fallback
+    method_map = {
+        "inv_te":       ("⚖️", "Inverse-TE weighting"),
+        "momentum_rank":("🚀", "Momentum-rank weighting"),
+        "vol_target":   ("🎯", "Vol-targeted weighting"),
+    }
+    m_emoji, m_label = method_map.get(raw_method, ("⚖️", raw_method))
 
-def _fmt_pct(v, fallback="—") -> str:
-    """Format a float as percentage, showing fallback if None/nan."""
-    try:
-        f = float(v)
-        return f"{f*100:.2f}%" if not np.isnan(f) else fallback
-    except Exception:
-        return fallback
+    opt_period_str = _fmt_int(opt_period)
+    opt_n_str      = _fmt_int(opt_n)
+    target_n_str   = _fmt_int(target_n, opt_n_str)
+    ret_str        = _fmt_pct(best_ret)
+    as_of_str      = str(as_of) if as_of else "—"
 
-opt_period_str = _fmt_int(opt_period)
-opt_n_str      = _fmt_int(opt_n)
-target_n_str   = _fmt_int(target_n, opt_n_str)
-ret_str        = _fmt_pct(best_ret)
-as_of_str      = str(as_of) if as_of else "—"
+    # ── Hero box ──────────────────────────────────────────────────────────────
+    holdings = latest_wts[
+        (latest_wts["weight"] > 1e-6) &
+        (latest_wts["ticker"].str.strip() != "")
+    ].sort_values("weight", ascending=False) if not latest_wts.empty and "ticker" in latest_wts.columns else pd.DataFrame(columns=["ticker","weight"])
 
-# Holdings already filtered and sorted by load_holdings_and_config
-holdings    = latest_wts
-is_invested = len(holdings) > 0
+    is_invested = len(holdings) > 0
 
-# ── ETF cards ─────────────────────────────────────────────────────────────────
-if is_invested:
-    card_html = ""
-    for _, row in holdings.iterrows():
-        card_html += f"""
-        <div style="background:#f0f4ff;border:2.5px solid #2563EB;border-radius:14px;
-                    padding:22px 36px;display:inline-block;margin:8px 10px;
-                    text-align:center;min-width:130px">
-            <div style="font-size:32px;font-weight:800;color:#1e3a8a;
-                        letter-spacing:2px">{row['ticker']}</div>
-            <div style="font-size:18px;color:#2563EB;font-weight:700;
-                        margin-top:6px">{row['weight']*100:.1f}%</div>
+    if is_invested:
+        card_html = ""
+        for _, row in holdings.iterrows():
+            card_html += f"""
+            <div style="background:#f0f4ff;border:2.5px solid #2563EB;border-radius:14px;
+                        padding:22px 36px;display:inline-block;margin:8px 10px;text-align:center;min-width:130px">
+                <div style="font-size:32px;font-weight:800;color:#1e3a8a;letter-spacing:2px">{row['ticker']}</div>
+                <div style="font-size:18px;color:#2563EB;font-weight:700;margin-top:6px">{row['weight']*100:.1f}%</div>
+            </div>"""
+    else:
+        card_html = """
+        <div style="background:#fef9c3;border:2px solid #ca8a04;border-radius:12px;
+                    padding:20px 28px;display:inline-block;margin:6px 0;color:#713f12">
+            <span style="font-size:22px;margin-right:10px">⚠️</span>
+            <span style="font-size:18px;font-weight:600">No signal — stay in cash.</span>
         </div>"""
-else:
-    card_html = """
-    <div style="background:#fef9c3;border:2px solid #ca8a04;border-radius:12px;
-                padding:20px 28px;display:inline-block;margin:6px 0;color:#713f12">
-        <span style="font-size:22px;margin-right:10px">⚠️</span>
-        <span style="font-size:18px;font-weight:600">
-            No signal — all ETFs excluded by momentum/trend filter. Stay in cash.
-        </span>
-    </div>"""
 
-# ── Config footer ──────────────────────────────────────────────────────────────
-pill = (
-    "background:#e8f0fe;border-radius:8px;padding:8px 16px;"
-    "font-size:15px;color:#1e40af;font-weight:600;"
-    "margin-right:10px;display:inline-block;margin-bottom:6px"
-)
-config_html = (
-    f'<span style="{pill}">⏱ Hold {opt_period_str}d</span>'
-    f'<span style="{pill}">📦 Target {target_n_str} ETF(s) · Actual {opt_n_str}</span>'
-    f'<span style="{pill}">{method_emoji} {method_label}</span>'
-    f'<span style="{pill}">📈 {ret_str} best ann. return (trailing 252d)</span>'
-    f'<span style="{pill}">📅 Signals as of {as_of_str}</span>'
-)
-
-action_html = f"""
-<div style="background:#ffffff;border:2.5px solid #2563EB;border-radius:16px;
-            padding:28px 32px;margin:8px 0 28px 0;">
-    <div style="font-size:13px;letter-spacing:3px;color:#6b7280;
-                text-transform:uppercase;margin-bottom:20px;font-weight:700">
-        🎯 &nbsp;Action for {today_label} — Hold at Market Open
-    </div>
-    <div style="margin-bottom:24px">{card_html}</div>
-    <div style="border-top:1.5px solid #e5e7eb;padding-top:14px">
-        {config_html}
-    </div>
-</div>
-"""
-st.markdown(action_html, unsafe_allow_html=True)
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — KPI ROW
-# ════════════════════════════════════════════════════════════════════════════════
-
-inception_year = latest_opt.get("inception_year", 2005 if prefix == "equity" else 2007)
-si_label = f"Since {inception_year}"
-
-try:
-    sdf = summary_df.copy()
-    if "Period" in sdf.columns:
-        sdf = sdf.set_index("Period")
-    si  = sdf.loc["Since Inception"] if "Since Inception" in sdf.index else sdf.iloc[-1]
-    st.caption(f"📅 Performance metrics shown from 1 Jan {inception_year} — 18 Mar 2026")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(f"Gross Return ({si_label})",  f"{float(si['Composite Gross Return'])*100:.2f}%")
-    c2.metric(f"Net Return ({si_label})",    f"{float(si['Composite Net Return'])*100:.2f}%")
-    c3.metric(f"Excess Return ({si_label})", f"{float(si['Excess Return (gross)'])*100:+.2f}%")
-    c4.metric("Sharpe Ratio",                f"{float(si['Composite Sharpe']):.2f}")
-    c5.metric("Info Ratio",                  f"{float(si['Information Ratio']):.2f}")
-except Exception:
-    pass
-
-st.markdown("---")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — ROLLING EXCESS RETURNS
-# ════════════════════════════════════════════════════════════════════════════════
-
-if not rolling_df.empty:
-    st.subheader("Rolling Annualised Excess Returns vs Benchmark")
-    st.plotly_chart(
-        rolling_chart(rolling_df, f"{universe} Strategy — Excess Return over {bench_label}"),
-        width="stretch",
+    pill = ("background:#e8f0fe;border-radius:8px;padding:8px 16px;"
+            "font-size:15px;color:#1e40af;font-weight:600;"
+            "margin-right:10px;display:inline-block;margin-bottom:6px")
+    config_html = (
+        f'<span style="{pill}">⏱ Hold {opt_period_str}d</span>'
+        f'<span style="{pill}">📦 Target {target_n_str} · Actual {opt_n_str}</span>'
+        f'<span style="{pill}">{m_emoji} {m_label}</span>'
+        f'<span style="{pill}">📈 {ret_str} best ann. return (trailing 252d)</span>'
+        f'<span style="{pill}">📅 Signals as of {as_of_str}</span>'
     )
 
-st.markdown("---")
+    st.markdown(f"""
+    <div style="background:#ffffff;border:2.5px solid #2563EB;border-radius:16px;padding:28px 32px;margin:8px 0 28px 0;">
+        <div style="font-size:13px;letter-spacing:3px;color:#6b7280;text-transform:uppercase;margin-bottom:20px;font-weight:700">
+            🎯 &nbsp;Action for {today_label} — Hold at Market Open
+        </div>
+        <div style="margin-bottom:24px">{card_html}</div>
+        <div style="border-top:1.5px solid #e5e7eb;padding-top:14px">{config_html}</div>
+    </div>""", unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — ANNUALISED PERFORMANCE SUMMARY
-# ════════════════════════════════════════════════════════════════════════════════
-
-st.subheader("Annualised Performance Summary")
-if not summary_df.empty:
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    si_label = f"Since {inc_year}"
     try:
         sdf = summary_df.copy()
         if "Period" in sdf.columns:
             sdf = sdf.set_index("Period")
-        st.markdown(summary_html(sdf), unsafe_allow_html=True)
-    except Exception as e:
-        st.dataframe(summary_df, width="stretch")
-
-st.markdown("---")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — CALENDAR YEAR RETURNS
-# ════════════════════════════════════════════════════════════════════════════════
-
-st.subheader("Calendar Year Returns")
-if not calendar_df.empty:
-    try:
-        cdf = calendar_df.copy()
-        if "Year" in cdf.columns:
-            cdf = cdf.set_index("Year")
-        for col in cdf.columns:
-            cdf[col] = cdf[col].map(
-                lambda v: f"{v*100:+.2f}%" if pd.notna(v) else "—"
-            )
-        st.dataframe(cdf.sort_index(ascending=False), width="stretch")
+        si = sdf.loc["Since Inception"] if "Since Inception" in sdf.index else sdf.iloc[-1]
+        st.caption(f"📅 Performance metrics: 1 Jan {inc_year} — {as_of_str}")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric(f"Gross Return ({si_label})",  f"{float(si['Composite Gross Return'])*100:.2f}%")
+        c2.metric(f"Net Return ({si_label})",    f"{float(si['Composite Net Return'])*100:.2f}%")
+        c3.metric(f"Excess Return ({si_label})", f"{float(si['Excess Return (gross)'])*100:+.2f}%")
+        c4.metric("Sharpe Ratio",                f"{float(si['Composite Sharpe']):.2f}")
+        c5.metric("Info Ratio",                  f"{float(si['Information Ratio']):.2f}")
     except Exception:
-        st.dataframe(calendar_df, width="stretch")
+        pass
+
+    st.markdown("---")
+
+    # ── Rolling excess returns ────────────────────────────────────────────────
+    if not rolling_df.empty:
+        st.subheader("Rolling Annualised Excess Returns vs Benchmark")
+        st.plotly_chart(
+            rolling_chart(rolling_df, f"{option_label} — Excess Return over {bench_label}"),
+            width="stretch",
+        )
+
+    st.markdown("---")
+
+    # ── Performance summary ───────────────────────────────────────────────────
+    st.subheader("Annualised Performance Summary")
+    if not summary_df.empty:
+        try:
+            sdf = summary_df.copy()
+            if "Period" in sdf.columns:
+                sdf = sdf.set_index("Period")
+            st.markdown(summary_html(sdf), unsafe_allow_html=True)
+        except Exception:
+            st.dataframe(summary_df, width="stretch")
+
+    st.markdown("---")
+
+    # ── Calendar year ─────────────────────────────────────────────────────────
+    st.subheader("Calendar Year Returns")
+    if not calendar_df.empty:
+        try:
+            cdf = calendar_df.copy()
+            if "Year" in cdf.columns:
+                cdf = cdf.set_index("Year")
+            for col in cdf.columns:
+                cdf[col] = cdf[col].map(lambda v: f"{v*100:+.2f}%" if pd.notna(v) else "—")
+            st.dataframe(cdf.sort_index(ascending=False), width="stretch")
+        except Exception:
+            st.dataframe(calendar_df, width="stretch")
+
+
+# ── Render both tabs ──────────────────────────────────────────────────────────
+inc_year = 2005 if prefix == "equity" else 2007
+
+with tab_a:
+    render_option(
+        key           = f"{prefix}_a",
+        option_label  = "Option A — TrendFolios Base",
+        bench_label   = bench_label,
+        today_label   = today_label,
+        inception_year = inc_year,
+    )
+
+with tab_b:
+    render_option(
+        key           = f"{prefix}_b",
+        option_label  = "Option B — Enhanced",
+        bench_label   = bench_label,
+        today_label   = today_label,
+        inception_year = inc_year,
+    )
