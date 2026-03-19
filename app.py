@@ -53,10 +53,14 @@ def load(config: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_latest_weights(prefix: str) -> pd.DataFrame:
-    config = f"{prefix}_latest_weights"
-    split  = _get_split(config)
-    ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
-    return ds.to_pandas()
+    try:
+        config = f"{prefix}_latest_weights"
+        split  = _get_split(config)
+        ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
+        df = ds.to_pandas()
+        return df if not df.empty else pd.DataFrame(columns=["ticker", "weight"])
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "weight"])
 
 
 @st.cache_data(ttl=3600)
@@ -248,8 +252,8 @@ with st.spinner("Loading data from HuggingFace …"):
         rolling_df   = load(f"{prefix}_rolling")
         summary_df   = load(f"{prefix}_summary")
         calendar_df  = load(f"{prefix}_calendar")
-        latest_wts   = load_latest_weights(prefix)
         inclusion_df = load(f"{prefix}_inclusion")
+        latest_wts   = load_latest_weights(prefix)
         latest_opt   = load_latest_optimal(prefix)
         opt_params   = load_optimal_params(prefix)
         data_loaded  = True
@@ -327,12 +331,12 @@ if data_loaded:
     with col_left:
         st.plotly_chart(
             growth_chart(growth_df, f"Growth of $1 — {universe}", universe, bench_label),
-            use_container_width=True,
+            width="stretch",
         )
     with col_right:
         st.plotly_chart(
             rolling_chart(rolling_df, f"Rolling Annualised Excess Return — {universe}"),
-            use_container_width=True,
+            width="stretch",
         )
 
     # ── Optimal params history ────────────────────────────────────────────────
@@ -353,7 +357,7 @@ if data_loaded:
                 margin=dict(l=0, r=0, t=40, b=0),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_p, use_container_width=True)
+            st.plotly_chart(fig_p, width="stretch")
         with col_n:
             fig_n = go.Figure()
             fig_n.add_trace(go.Scatter(
@@ -368,28 +372,37 @@ if data_loaded:
                 margin=dict(l=0, r=0, t=40, b=0),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_n, use_container_width=True)
+            st.plotly_chart(fig_n, width="stretch")
 
     # ── Current allocation ────────────────────────────────────────────────────
     st.subheader("Current Portfolio Allocation")
     col_w, col_inc = st.columns([1, 2])
     with col_w:
-        if not latest_wts.empty:
+        wts_valid = (
+            latest_wts is not None
+            and not latest_wts.empty
+            and "ticker" in latest_wts.columns
+            and "weight" in latest_wts.columns
+            and len(latest_wts) > 0
+        )
+        if wts_valid:
             st.plotly_chart(
                 weights_chart(latest_wts, "Latest Weights"),
-                use_container_width=True,
+                width="stretch",
             )
+        else:
+            st.info("Latest weights not yet available — run the pipeline first.")
     with col_inc:
         st.markdown("**Inclusion Signal (recent 60 days)**")
         try:
             inc_recent = inclusion_df.tail(60).T
             inc_recent.columns = [str(d.date()) for d in inc_recent.columns]
-            styled = inc_recent.style.applymap(
+            styled = inc_recent.style.map(
                 lambda v: "background-color:#bbf7d0" if v == 1 else "background-color:#fecaca"
             ).format("{:.0f}")
-            st.dataframe(styled, use_container_width=True, height=400)
+            st.dataframe(styled, width="stretch", height=400)
         except Exception:
-            st.dataframe(inclusion_df.tail(60).T, use_container_width=True)
+            st.dataframe(inclusion_df.tail(60).T, width="stretch")
 
     # ── Performance table ─────────────────────────────────────────────────────
     st.subheader("Annualised Performance Summary")
@@ -410,6 +423,6 @@ if data_loaded:
                 cal_display[col] = cal_display[col].map(
                     lambda v: f"{v*100:+.2f}%" if pd.notna(v) else "—"
                 )
-            st.dataframe(cal_display.sort_index(ascending=False), use_container_width=True)
+            st.dataframe(cal_display.sort_index(ascending=False), width="stretch")
         except Exception:
-            st.dataframe(calendar_df, use_container_width=True)
+            st.dataframe(calendar_df, width="stretch")
