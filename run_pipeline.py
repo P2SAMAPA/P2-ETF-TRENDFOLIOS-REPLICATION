@@ -16,9 +16,11 @@ from datasets import load_dataset, Dataset
 from huggingface_hub import HfApi
 
 import importlib
-sig_module  = importlib.import_module("signal_engine")
-port_module = importlib.import_module("portfolio")
-bt_module   = importlib.import_module("backtest")
+sig_module   = importlib.import_module("signal_engine")
+sig_module_b = importlib.import_module("signal_engine_b")
+port_module  = importlib.import_module("portfolio")
+port_module_b = importlib.import_module("portfolio_b")
+bt_module    = importlib.import_module("backtest")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,102 @@ def push(ds: Dataset, config: str, msg: str):
 
 # ── Per-universe pipeline ─────────────────────────────────────────────────────
 
+def _push_option_results(
+    prefix: str,
+    option: str,           # "a" or "b"
+    label: str,
+    port: dict,
+    bt: dict,
+    signals: dict,
+    bench_returns: pd.Series,
+    prices: pd.DataFrame,
+    inception_year: int,
+):
+    """Push all results for one option (A or B) to HuggingFace."""
+    import json, tempfile, os as _os
+    key = f"{prefix}_{option}"   # e.g. "equity_a" or "equity_b"
+
+    # Config
+    latest_w = port["latest_weights"]
+    if isinstance(latest_w, pd.Series):
+        latest_w = latest_w.reset_index()
+        latest_w.columns = ["ticker", "weight"]
+    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+
+    config_data = {
+        "option":          option.upper(),
+        "optimal_period":  int(port["latest_period"]),
+        "optimal_n":       int(port["latest_n"]),
+        "target_n":        int(port.get("latest_target_n", port["latest_n"])),
+        "optimal_method":  str(port.get("latest_method", "inv_te")),
+        "best_ann_return": round(float(port["latest_best_return"]), 6),
+        "as_of":           str(prices.index[-1].date()),
+        "holdings":        ",".join(latest_w["ticker"].tolist()),
+        "inception_year":  inception_year,
+        "is_invested":     not latest_w.empty,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                     delete=False, prefix=f"{key}_config_") as f:
+        json.dump(config_data, f)
+        tmp_path = f.name
+    api = HfApi()
+    api.upload_file(
+        path_or_fileobj=tmp_path,
+        path_in_repo=f"{key}_config.json",
+        repo_id=HF_REPO_ID, repo_type="dataset",
+        token=HF_TOKEN,
+        commit_message=f"update: {label} option {option.upper()} config",
+    )
+    _os.unlink(tmp_path)
+    print(f"  ✓ Pushed → {key}_config.json")
+
+    # Weights
+    push(df_to_dataset(port["weights"]),
+         f"{key}_weights", f"update: {label} option {option.upper()} weights")
+
+    # Returns
+    ret_df = pd.DataFrame({
+        "portfolio_gross": port["portfolio_returns"],
+        "portfolio_net":   bt["port_returns_net"],
+        "benchmark":       bench_returns,
+    })
+    push(df_to_dataset(ret_df), f"{key}_returns",
+         f"update: {label} option {option.upper()} returns")
+
+    # Growth
+    growth_df = pd.DataFrame({
+        "portfolio_gross": bt["growth_port"],
+        "benchmark":       bt["growth_bench"],
+    })
+    push(df_to_dataset(growth_df), f"{key}_growth",
+         f"update: {label} option {option.upper()} growth")
+
+    # Rolling excess
+    rolling_df = pd.DataFrame({
+        "rolling_1y": bt["rolling_1y"],
+        "rolling_3y": bt["rolling_3y"],
+        "rolling_5y": bt["rolling_5y"],
+    })
+    push(df_to_dataset(rolling_df), f"{key}_rolling",
+         f"update: {label} option {option.upper()} rolling")
+
+    # Summary
+    summary = bt["summary"].reset_index()
+    push(Dataset.from_pandas(summary, preserve_index=False),
+         f"{key}_summary", f"update: {label} option {option.upper()} summary")
+
+    # Calendar
+    cal = bt["calendar"].reset_index()
+    push(Dataset.from_pandas(cal, preserve_index=False),
+         f"{key}_calendar", f"update: {label} option {option.upper()} calendar")
+
+    # Inclusion
+    push(df_to_dataset(signals["inclusion"]),
+         f"{key}_inclusion", f"update: {label} option {option.upper()} inclusion")
+
+    print(f"  ✓ {label} Option {option.upper()} push complete.")
+
+
 def run_universe(
     prices_all: pd.DataFrame,
     tickers: list[str],
@@ -128,13 +226,14 @@ def run_universe(
     label: str,
     start_date: str,
 ):
-    """Run signals → portfolio → backtest for one universe (equity or FI)."""
+    """Run Option A and Option B in parallel for one universe."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     print(f"\n{'='*60}")
     print(f"  Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
     print(f"  Hard start date: {start_date}")
     print(f"{'='*60}")
 
-    # Filter to tickers that actually exist in prices
     available = [t for t in tickers if t in prices_all.columns]
     missing   = [t for t in tickers if t not in prices_all.columns]
     if missing:
@@ -143,137 +242,60 @@ def run_universe(
     prices = prices_all[available].dropna(how="all")
     bench  = prices_all[benchmark_ticker].dropna()
 
-    # Align to common dates AND enforce hard start date
     common = prices.index.intersection(bench.index)
     common = common[common >= pd.Timestamp(start_date)]
     prices = prices.loc[common]
     bench  = bench.loc[common]
 
     inception_year = pd.Timestamp(start_date).year
-    print(f"  → Data from {prices.index[0].date()} to {prices.index[-1].date()} "
-          f"({len(prices)} trading days)")
+    bench_returns  = bench.pct_change().dropna()
+    prefix_key     = "equity" if label == "equity" else "fixed_income"
 
-    # ── Signals ──────────────────────────────────────────────────────────────
-    print("  Computing signals …")
-    signals = sig_module.compute_signals(prices)
+    print(f"  → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
 
-    # ── Portfolio ─────────────────────────────────────────────────────────────
-    print("  Building portfolio …")
-    port = port_module.build_portfolio(
-        prices    = prices,
-        inclusion = signals["inclusion"],
-        benchmark_prices = bench,
-    )
+    # ── Compute signals (sequential — shared base data needed) ────────────────
+    print("  Computing signals (A + B) …")
+    signals_a = sig_module.compute_signals(prices)
+    signals_b = sig_module_b.compute_signals_b(prices, bench)
 
-    # ── Backtest ──────────────────────────────────────────────────────────────
-    print("  Running backtest …")
-    bench_returns = bench.pct_change().dropna()
-    bt = bt_module.run_backtest(
-        port_returns  = port["portfolio_returns"],
-        bench_returns = bench_returns,
-        label         = label,
-    )
+    # ── Run optimisers + backtests + pushes IN PARALLEL ───────────────────────
+    def run_option_a():
+        print(f"\n  [A] Building portfolio …")
+        port = port_module.build_portfolio(
+            prices=prices, inclusion=signals_a["inclusion"],
+            benchmark_prices=bench,
+        )
+        bt = bt_module.run_backtest(
+            port_returns=port["portfolio_returns"],
+            bench_returns=bench_returns, label=label,
+        )
+        _push_option_results(prefix_key, "a", label, port, bt,
+                             signals_a, bench_returns, prices, inception_year)
+        return bt["summary"]
 
-    # ── Push results ──────────────────────────────────────────────────────────
-    prefix = label
+    def run_option_b():
+        print(f"\n  [B] Building portfolio …")
+        port = port_module_b.build_portfolio_b(
+            prices=prices, inclusion=signals_b["inclusion"],
+            benchmark_prices=bench,
+        )
+        bt = bt_module.run_backtest(
+            port_returns=port["portfolio_returns"],
+            bench_returns=bench_returns, label=label,
+        )
+        _push_option_results(prefix_key, "b", label, port, bt,
+                             signals_b, bench_returns, prices, inception_year)
+        return bt["summary"]
 
-    # ── Prepare config values ─────────────────────────────────────────────────
-    latest_w = port["latest_weights"]
-    if isinstance(latest_w, pd.Series):
-        latest_w = latest_w.reset_index()
-        latest_w.columns = ["ticker", "weight"]
-    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+    print(f"\n  Running Option A + B in parallel …")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(run_option_a)
+        future_b = executor.submit(run_option_b)
+        summary_a = future_a.result()
+        summary_b = future_b.result()
 
-    optimal_period = int(port["latest_period"])
-    optimal_n      = int(port["latest_n"])
-    target_n_val   = int(port.get("latest_target_n", port["latest_n"]))
-    optimal_method = str(port.get("latest_method", "inv_te"))
-    best_ret_val   = round(float(port["latest_best_return"]), 6)
-    as_of_val      = str(prices.index[-1].date())
-    holdings_str   = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
-
-    # ── Weights — push clean (no extra columns, no schema corruption) ─────────
-    push(df_to_dataset(port["weights"]),
-         f"{prefix}_weights", f"update: {label} weights")
-
-    # ── Config — push as a plain JSON file to the HF repo (no parquet) ────────
-    import json, tempfile, os
-    config_data = {
-        "optimal_period":  optimal_period,
-        "optimal_n":       optimal_n,
-        "target_n":        target_n_val,
-        "optimal_method":  optimal_method,
-        "best_ann_return": best_ret_val,
-        "as_of":           as_of_val,
-        "holdings":        holdings_str,
-        "inception_year":  inception_year,
-        "is_invested":     not latest_w.empty,
-    }
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                     delete=False, prefix=f"{prefix}_config_") as f:
-        json.dump(config_data, f)
-        tmp_path = f.name
-
-    api = HfApi()
-    api.upload_file(
-        path_or_fileobj=tmp_path,
-        path_in_repo=f"{prefix}_config.json",
-        repo_id=HF_REPO_ID,
-        repo_type="dataset",
-        token=HF_TOKEN,
-        commit_message=f"update: {label} config snapshot",
-    )
-    os.unlink(tmp_path)
-    print(f"  ✓ Pushed → {prefix}_config.json")
-
-    # Inclusion signals
-    push(df_to_dataset(signals["inclusion"]),
-         f"{prefix}_inclusion", f"update: {label} inclusion signals")
-
-    # Portfolio returns (gross + net)
-    ret_df = pd.DataFrame({
-        "portfolio_gross": port["portfolio_returns"],
-        "portfolio_net":   bt["port_returns_net"],
-        "benchmark":       bench_returns,
-    })
-    push(df_to_dataset(ret_df), f"{prefix}_returns",
-         f"update: {label} daily returns")
-
-    # Growth of $1
-    growth_df = pd.DataFrame({
-        "portfolio_gross": bt["growth_port"],
-        "benchmark":       bt["growth_bench"],
-    })
-    push(df_to_dataset(growth_df), f"{prefix}_growth",
-         f"update: {label} growth of $1")
-
-    # Rolling excess returns
-    rolling_df = pd.DataFrame({
-        "rolling_1y": bt["rolling_1y"],
-        "rolling_3y": bt["rolling_3y"],
-        "rolling_5y": bt["rolling_5y"],
-    })
-    push(df_to_dataset(rolling_df), f"{prefix}_rolling",
-         f"update: {label} rolling excess returns")
-
-    # Summary performance table
-    summary = bt["summary"].reset_index()
-    push(Dataset.from_pandas(summary, preserve_index=False),
-         f"{prefix}_summary", f"update: {label} summary table")
-
-    # Calendar year table
-    cal = bt["calendar"].reset_index()
-    push(Dataset.from_pandas(cal, preserve_index=False),
-         f"{prefix}_calendar", f"update: {label} calendar year returns")
-
-    # Rolling optimal params history
-    opt_df = port["optimal_params"].reset_index()
-    opt_df["date"] = opt_df["date"].dt.strftime("%Y-%m-%d")
-    push(Dataset.from_pandas(opt_df, preserve_index=False),
-         f"{prefix}_optimal_params", f"update: {label} optimal params history")
-
-    print(f"  ✓ {label} pipeline complete.")
-    return bt["summary"]
+    print(f"\n  ✓ {label} complete — both options pushed.")
+    return summary_a, summary_b
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -294,32 +316,53 @@ def main():
     print("\nPushing updated prices …")
     push(df_to_dataset(prices), "prices", "update: prices refresh")
 
-    # Run both universes
-    eq_summary = run_universe(
-        prices_all       = prices,
-        tickers          = EQUITY_ETFS,
-        benchmark_ticker = BENCHMARKS["equity"],
-        label            = "equity",
-        start_date       = UNIVERSE_START["equity"],
-    )
+    # Run both universes in parallel
+    from concurrent.futures import ThreadPoolExecutor
 
-    fi_summary = run_universe(
-        prices_all       = prices,
-        tickers          = FIXED_INCOME_ETFS,
-        benchmark_ticker = BENCHMARKS["fixed_income"],
-        label            = "fixed_income",
-        start_date       = UNIVERSE_START["fixed_income"],
-    )
+    def run_equity():
+        return run_universe(
+            prices_all       = prices,
+            tickers          = EQUITY_ETFS,
+            benchmark_ticker = BENCHMARKS["equity"],
+            label            = "equity",
+            start_date       = UNIVERSE_START["equity"],
+        )
+
+    def run_fixed_income():
+        return run_universe(
+            prices_all       = prices,
+            tickers          = FIXED_INCOME_ETFS,
+            benchmark_ticker = BENCHMARKS["fixed_income"],
+            label            = "fixed_income",
+            start_date       = UNIVERSE_START["fixed_income"],
+        )
+
+    print("\nRunning Equity + Fixed Income universes in parallel …")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_eq = executor.submit(run_equity)
+        future_fi = executor.submit(run_fixed_income)
+        eq_summary_a, eq_summary_b = future_eq.result()
+        fi_summary_a, fi_summary_b = future_fi.result()
 
     print("\n" + "=" * 60)
-    print("EQUITY SUMMARY")
+    print("EQUITY — Option A Summary")
     print("=" * 60)
-    print(eq_summary.to_string())
+    print(eq_summary_a.to_string())
 
     print("\n" + "=" * 60)
-    print("FIXED INCOME SUMMARY")
+    print("EQUITY — Option B Summary")
     print("=" * 60)
-    print(fi_summary.to_string())
+    print(eq_summary_b.to_string())
+
+    print("\n" + "=" * 60)
+    print("FIXED INCOME — Option A Summary")
+    print("=" * 60)
+    print(fi_summary_a.to_string())
+
+    print("\n" + "=" * 60)
+    print("FIXED INCOME — Option B Summary")
+    print("=" * 60)
+    print(fi_summary_b.to_string())
 
     print("\n✓ All done.")
 
