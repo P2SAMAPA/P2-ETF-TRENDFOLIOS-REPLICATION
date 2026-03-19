@@ -80,76 +80,56 @@ def load(config: str) -> pd.DataFrame:
 @st.cache_data(ttl=900)
 def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
     """
-    Reads EVERYTHING from {prefix}_weights — the one large reliable dataset.
-
-    The pipeline embeds optimal config columns on every row of this dataset,
-    so the last row gives us both current holdings AND the optimal config.
-
-    Columns expected: ticker, weight, optimal_period, optimal_n, target_n,
-                      optimal_method, best_ann_return, as_of, is_invested,
-                      inception_year
+    Reads from {prefix}_weights — the large reliable dataset (5000+ rows).
+    Config is embedded on the last row as extra float/string columns.
+    Holdings are derived from ETF weight columns on the last row.
     """
     holdings       = pd.DataFrame(columns=["ticker", "weight"])
     opt            = {}
     inception_year = 2005 if prefix == "equity" else 2007
 
-    try:
-        # ── Try latest_weights first (has embedded config, smaller/faster) ────
-        config = f"{prefix}_latest_weights"
-        split  = _get_split(config)
-        ds     = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
-        df     = ds.to_pandas()
+    config_col_names = {"optimal_period", "optimal_n", "target_n", "optimal_method",
+                        "best_ann_return", "as_of", "inception_year"}
 
-        if not df.empty and "ticker" in df.columns:
-            # Extract real holdings (non-padding rows)
-            real = df[
-                (df["weight"] > 1e-6) &
-                (df["ticker"].str.strip() != "") &
-                (df["ticker"] != "CASH")
-            ].sort_values("weight", ascending=False)
-
-            if not real.empty:
-                holdings = real[["ticker", "weight"]].copy()
-
-            # Extract config from first row (all rows have same config values)
-            first = df.iloc[0]
-            opt = {
-                "optimal_period":  _coerce_int(first.get("optimal_period"), 0),
-                "optimal_n":       len(holdings),
-                "target_n":        _coerce_int(first.get("target_n"), len(holdings)),
-                "optimal_method":  str(first.get("optimal_method", "inv_te")),
-                "best_ann_return": _coerce_float(first.get("best_ann_return")),
-                "as_of":           str(first.get("as_of", "")),
-                "is_invested":     len(holdings) > 0,
-                "inception_year":  _coerce_int(first.get("inception_year"), inception_year),
-            }
-            return holdings, opt
-
-    except Exception as e:
-        st.sidebar.warning(f"latest_weights fallback: {e}")
-
-    # ── Fallback: derive from large weights dataset (always works) ────────────
     try:
         weights_df = load(f"{prefix}_weights")
-        if not weights_df.empty:
-            last_row = weights_df.iloc[-1]
-            as_of    = str(weights_df.index[-1].date())
-            w = last_row[last_row > 1e-6].sort_values(ascending=False)
-            if not w.empty:
-                holdings = pd.DataFrame({
-                    "ticker": w.index.tolist(),
-                    "weight": w.values.tolist(),
-                })
-            opt = {
-                "optimal_period":  0,
-                "optimal_n":       len(holdings),
-                "target_n":        len(holdings),
-                "optimal_method":  "inv_te",
-                "best_ann_return": float("nan"),
-                "as_of":           as_of,
-                "is_invested":     len(holdings) > 0,
-                "inception_year":  inception_year,
-            }
+        if weights_df.empty:
+            return holdings, opt
+
+        last   = weights_df.iloc[-1]
+        as_of  = str(weights_df.index[-1].date())
+
+        # ETF columns = everything that is NOT a config column
+        etf_cols = [c for c in weights_df.columns if c not in config_col_names]
+
+        # Holdings from ETF weight columns
+        w = last[etf_cols].apply(pd.to_numeric, errors="coerce")
+        w = w[w > 1e-6].sort_values(ascending=False)
+        if not w.empty:
+            holdings = pd.DataFrame({
+                "ticker": w.index.tolist(),
+                "weight": w.values.tolist(),
+            })
+
+        # Config from embedded columns on last row
+        period_raw = last.get("optimal_period", np.nan)
+        ret_raw    = last.get("best_ann_return", np.nan)
+        method_raw = last.get("optimal_method", "inv_te")
+        inc_raw    = last.get("inception_year", inception_year)
+        asof_raw   = last.get("as_of", as_of)
+        tn_raw     = last.get("target_n", len(holdings))
+
+        opt = {
+            "optimal_period":  _coerce_int(period_raw, 0),
+            "optimal_n":       len(holdings),
+            "target_n":        _coerce_int(tn_raw, len(holdings)),
+            "optimal_method":  str(method_raw) if pd.notna(method_raw) else "inv_te",
+            "best_ann_return": _coerce_float(ret_raw),
+            "as_of":           str(asof_raw) if pd.notna(asof_raw) else as_of,
+            "is_invested":     len(holdings) > 0,
+            "inception_year":  _coerce_int(inc_raw, inception_year),
+        }
+
     except Exception as e:
         st.warning(f"Could not load {prefix}_weights: {e}")
 
@@ -294,10 +274,6 @@ with st.spinner("Loading …"):
 
 if not data_loaded:
     st.stop()
-
-# Debug expander — shows what's in latest_opt so we can diagnose blank pills
-with st.sidebar.expander("🔍 Debug: config data", expanded=False):
-    st.json(latest_opt if latest_opt else {"status": "empty dict"})
 
 # ════════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — WHAT TO HOLD TODAY  (most prominent)
