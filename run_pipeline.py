@@ -175,11 +175,37 @@ def run_universe(
     )
 
     # ── Push results ──────────────────────────────────────────────────────────
-    prefix = label  # e.g. "equity" or "fixed_income"
+    prefix = label
 
-    # Weights
-    push(df_to_dataset(port["weights"]),
-         f"{prefix}_weights", f"update: {label} weights")
+    # ── Prepare config values ─────────────────────────────────────────────────
+    latest_w = port["latest_weights"]
+    if isinstance(latest_w, pd.Series):
+        latest_w = latest_w.reset_index()
+        latest_w.columns = ["ticker", "weight"]
+    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+
+    optimal_period = int(port["latest_period"])
+    optimal_n      = int(port["latest_n"])
+    target_n_val   = int(port.get("latest_target_n", port["latest_n"]))
+    optimal_method = str(port.get("latest_method", "inv_te"))
+    best_ret_val   = round(float(port["latest_best_return"]), 6)
+    as_of_val      = str(prices.index[-1].date())
+
+    # ── Weights — embed config on last row (large dataset, never fails on HF) ─
+    weights_df = port["weights"].copy()
+    config_cols = ["optimal_period", "optimal_n", "target_n", "optimal_method",
+                   "best_ann_return", "as_of", "inception_year"]
+    for col in config_cols:
+        weights_df[col] = np.nan
+    weights_df.loc[weights_df.index[-1], "optimal_period"]  = float(optimal_period)
+    weights_df.loc[weights_df.index[-1], "optimal_n"]       = float(optimal_n)
+    weights_df.loc[weights_df.index[-1], "target_n"]        = float(target_n_val)
+    weights_df.loc[weights_df.index[-1], "optimal_method"]  = optimal_method
+    weights_df.loc[weights_df.index[-1], "best_ann_return"] = best_ret_val
+    weights_df.loc[weights_df.index[-1], "as_of"]           = as_of_val
+    weights_df.loc[weights_df.index[-1], "inception_year"]  = float(inception_year)
+    push(df_to_dataset(weights_df),
+         f"{prefix}_weights", f"update: {label} weights + config")
 
     # Inclusion signals
     push(df_to_dataset(signals["inclusion"]),
@@ -221,55 +247,7 @@ def run_universe(
     push(Dataset.from_pandas(cal, preserve_index=False),
          f"{prefix}_calendar", f"update: {label} calendar year returns")
 
-    # ── Latest weights + optimal config — combined into one robust dataset ────
-    latest_w = port["latest_weights"]
-    if isinstance(latest_w, pd.Series):
-        latest_w = latest_w.reset_index()
-        latest_w.columns = ["ticker", "weight"]
-    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
-
-    holdings_str   = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
-    optimal_period = int(port["latest_period"])
-    optimal_n      = int(port["latest_n"])
-    target_n_val   = int(port.get("latest_target_n", port["latest_n"]))
-    optimal_method = str(port.get("latest_method", "inv_te"))
-    best_ret_val   = round(float(port["latest_best_return"]), 6)
-    as_of_val      = str(prices.index[-1].date())
-    is_invested    = not latest_w.empty
-
-    # Pad to at least 3 rows (HF parquet needs >1 row to avoid generation errors)
-    if latest_w.empty:
-        rows = [{"ticker": "CASH", "weight": 1.0}]
-    else:
-        rows = latest_w.to_dict("records")
-
-    # Attach optimal config to EVERY row as extra columns — no single-row dataset needed
-    for r in rows:
-        r["optimal_period"]  = optimal_period
-        r["optimal_n"]       = optimal_n
-        r["target_n"]        = target_n_val
-        r["optimal_method"]  = optimal_method
-        r["best_ann_return"] = best_ret_val
-        r["holdings"]        = holdings_str
-        r["as_of"]           = as_of_val
-        r["is_invested"]     = is_invested
-        r["inception_year"]  = inception_year
-
-    # Pad to minimum 3 rows to avoid HF parquet single-row generation errors
-    while len(rows) < 3:
-        rows.append({
-            "ticker": "", "weight": 0.0,
-            "optimal_period": optimal_period, "optimal_n": optimal_n,
-            "target_n": target_n_val, "optimal_method": optimal_method,
-            "best_ann_return": best_ret_val, "holdings": holdings_str,
-            "as_of": as_of_val, "is_invested": is_invested,
-            "inception_year": inception_year,
-        })
-
-    push(Dataset.from_list(rows),
-         f"{prefix}_latest_weights", f"update: {label} latest weights + config")
-
-    # Rolling optimal params history (keep as-is — large enough to not fail)
+    # Rolling optimal params history
     opt_df = port["optimal_params"].reset_index()
     opt_df["date"] = opt_df["date"].dt.strftime("%Y-%m-%d")
     push(Dataset.from_pandas(opt_df, preserve_index=False),
