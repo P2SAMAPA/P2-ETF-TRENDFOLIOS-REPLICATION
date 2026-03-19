@@ -80,56 +80,56 @@ def load(config: str) -> pd.DataFrame:
 @st.cache_data(ttl=900)
 def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
     """
-    Reads from {prefix}_weights — the large reliable dataset (5000+ rows).
-    Config is embedded on the last row as extra float/string columns.
-    Holdings are derived from ETF weight columns on the last row.
+    Two separate reliable sources:
+    - {prefix}_config.json  : plain JSON file in HF repo → config values
+    - {prefix}_weights      : large parquet dataset → current holdings (last row)
     """
     holdings       = pd.DataFrame(columns=["ticker", "weight"])
     opt            = {}
     inception_year = 2005 if prefix == "equity" else 2007
 
-    config_col_names = {"optimal_period", "optimal_n", "target_n", "optimal_method",
-                        "best_ann_return", "as_of", "inception_year"}
+    # ── Load config from JSON file ────────────────────────────────────────────
+    try:
+        from huggingface_hub import hf_hub_download
+        json_path = hf_hub_download(
+            repo_id   = HF_REPO_ID,
+            filename  = f"{prefix}_config.json",
+            repo_type = "dataset",
+            token     = HF_TOKEN,
+        )
+        import json
+        with open(json_path) as f:
+            cfg = json.load(f)
+        opt = {
+            "optimal_period":  int(cfg.get("optimal_period", 0)),
+            "optimal_n":       int(cfg.get("optimal_n", 0)),
+            "target_n":        int(cfg.get("target_n", 0)),
+            "optimal_method":  str(cfg.get("optimal_method", "inv_te")),
+            "best_ann_return": float(cfg.get("best_ann_return", float("nan"))),
+            "as_of":           str(cfg.get("as_of", "")),
+            "inception_year":  int(cfg.get("inception_year", inception_year)),
+            "is_invested":     bool(cfg.get("is_invested", False)),
+        }
+    except Exception as e:
+        st.warning(f"Could not load {prefix}_config.json: {e}")
 
+    # ── Load holdings from last row of weights dataset ────────────────────────
     try:
         weights_df = load(f"{prefix}_weights")
-        if weights_df.empty:
-            return holdings, opt
-
-        last   = weights_df.iloc[-1]
-        as_of  = str(weights_df.index[-1].date())
-
-        # ETF columns = everything that is NOT a config column
-        etf_cols = [c for c in weights_df.columns if c not in config_col_names]
-
-        # Holdings from ETF weight columns
-        w = last[etf_cols].apply(pd.to_numeric, errors="coerce")
-        w = w[w > 1e-6].sort_values(ascending=False)
-        if not w.empty:
-            holdings = pd.DataFrame({
-                "ticker": w.index.tolist(),
-                "weight": w.values.tolist(),
-            })
-
-        # Config from embedded columns on last row
-        period_raw = last.get("optimal_period", np.nan)
-        ret_raw    = last.get("best_ann_return", np.nan)
-        method_raw = last.get("optimal_method", "inv_te")
-        inc_raw    = last.get("inception_year", inception_year)
-        asof_raw   = last.get("as_of", as_of)
-        tn_raw     = last.get("target_n", len(holdings))
-
-        opt = {
-            "optimal_period":  _coerce_int(period_raw, 0),
-            "optimal_n":       len(holdings),
-            "target_n":        _coerce_int(tn_raw, len(holdings)),
-            "optimal_method":  str(method_raw) if pd.notna(method_raw) else "inv_te",
-            "best_ann_return": _coerce_float(ret_raw),
-            "as_of":           str(asof_raw) if pd.notna(asof_raw) else as_of,
-            "is_invested":     len(holdings) > 0,
-            "inception_year":  _coerce_int(inc_raw, inception_year),
-        }
-
+        if not weights_df.empty:
+            last = weights_df.iloc[-1]
+            as_of = str(weights_df.index[-1].date())
+            w = last.apply(pd.to_numeric, errors="coerce")
+            w = w[w > 1e-6].sort_values(ascending=False)
+            if not w.empty:
+                holdings = pd.DataFrame({
+                    "ticker": w.index.tolist(),
+                    "weight": w.values.tolist(),
+                })
+            if not opt:
+                opt["as_of"] = as_of
+            opt["optimal_n"] = len(holdings)
+            opt["is_invested"] = len(holdings) > 0
     except Exception as e:
         st.warning(f"Could not load {prefix}_weights: {e}")
 
