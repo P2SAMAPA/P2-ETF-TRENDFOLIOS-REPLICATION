@@ -15,9 +15,10 @@ import numpy as np
 from datasets import load_dataset, Dataset
 from huggingface_hub import HfApi
 
-import signal as sig_module
-import portfolio as port_module
-import backtest as bt_module
+import importlib
+sig_module  = importlib.import_module("signal_engine")
+port_module = importlib.import_module("portfolio")
+bt_module   = importlib.import_module("backtest")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
