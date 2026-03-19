@@ -109,13 +109,15 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
         opt_df = load(f"{prefix}_optimal_params")
         if not opt_df.empty:
             last_opt = opt_df.iloc[-1]
+            inception_year = 2005 if prefix == "equity" else 2007
             opt = {
                 "optimal_period":  int(float(last_opt.get("optimal_period", 0))),
-                "optimal_n":       len(holdings),   # actual N from weights
+                "optimal_n":       len(holdings),
                 "target_n":        int(float(last_opt.get("optimal_n", 0))),
                 "best_ann_return": float(last_opt.get("best_ann_return", float("nan"))),
                 "as_of":           str(opt_df.index[-1].date()),
                 "is_invested":     len(holdings) > 0,
+                "inception_year":  inception_year,
             }
     except Exception as e:
         st.warning(f"Could not load {prefix}_optimal_params: {e}")
@@ -325,17 +327,21 @@ st.markdown(action_html, unsafe_allow_html=True)
 # SECTION 2 — KPI ROW
 # ════════════════════════════════════════════════════════════════════════════════
 
+inception_year = latest_opt.get("inception_year", 2005 if prefix == "equity" else 2007)
+si_label = f"Since {inception_year}"
+
 try:
     sdf = summary_df.copy()
     if "Period" in sdf.columns:
         sdf = sdf.set_index("Period")
     si  = sdf.loc["Since Inception"] if "Since Inception" in sdf.index else sdf.iloc[-1]
+    st.caption(f"📅 Performance metrics shown from 1 Jan {inception_year} — 18 Mar 2026")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Gross Return (SI)", f"{float(si['Composite Gross Return'])*100:.2f}%")
-    c2.metric("Net Return (SI)",   f"{float(si['Composite Net Return'])*100:.2f}%")
-    c3.metric("Excess Return",     f"{float(si['Excess Return (gross)'])*100:+.2f}%")
-    c4.metric("Sharpe Ratio",      f"{float(si['Composite Sharpe']):.2f}")
-    c5.metric("Info Ratio",        f"{float(si['Information Ratio']):.2f}")
+    c1.metric(f"Gross Return ({si_label})",  f"{float(si['Composite Gross Return'])*100:.2f}%")
+    c2.metric(f"Net Return ({si_label})",    f"{float(si['Composite Net Return'])*100:.2f}%")
+    c3.metric(f"Excess Return ({si_label})", f"{float(si['Excess Return (gross)'])*100:+.2f}%")
+    c4.metric("Sharpe Ratio",                f"{float(si['Composite Sharpe']):.2f}")
+    c5.metric("Info Ratio",                  f"{float(si['Information Ratio']):.2f}")
 except Exception:
     pass
 
