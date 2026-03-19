@@ -271,42 +271,42 @@ if data_loaded:
         holdings  = latest_opt.get("holdings", "")
         as_of     = latest_opt.get("as_of", "")
         ret_str   = f"{best_ret*100:.2f}%" if best_ret and not pd.isna(best_ret) else "—"
-        hold_list = holdings.split(",") if holdings else []
+        hold_list = [t.strip() for t in holdings.split(",") if t.strip()] if holdings else []
 
-        st.markdown(
-            f"""
-            <div style="background:linear-gradient(135deg,#1e3a5f,#1e40af);
-                        border-radius:12px;padding:20px 28px;margin-bottom:16px;color:white;">
-                <div style="font-size:11px;letter-spacing:2px;opacity:0.7;
-                            text-transform:uppercase;margin-bottom:6px;">
-                    🤖 Model Optimal Configuration — as of {as_of}
+        # Build holdings pills as a plain string first — avoids nested f-string issues
+        pill_style = "background:rgba(255,255,255,0.15);border-radius:6px;padding:2px 10px;margin:2px 4px;display:inline-block"
+        holdings_html = " ".join(
+            f'<span style="{pill_style}">{t}</span>' for t in hold_list
+        ) if hold_list else "—"
+
+        hero_html = f"""
+        <div style="background:linear-gradient(135deg,#1e3a5f,#1e40af);
+                    border-radius:12px;padding:20px 28px;margin-bottom:16px;color:white;">
+            <div style="font-size:11px;letter-spacing:2px;opacity:0.7;
+                        text-transform:uppercase;margin-bottom:10px;">
+                🤖 Model Optimal Configuration — as of {as_of}
+            </div>
+            <div style="display:flex;gap:48px;flex-wrap:wrap;align-items:center">
+                <div>
+                    <div style="font-size:32px;font-weight:700;line-height:1">{period}d</div>
+                    <div style="font-size:12px;opacity:0.75;margin-top:4px">Optimal hold period</div>
                 </div>
-                <div style="display:flex;gap:48px;flex-wrap:wrap;align-items:center">
-                    <div>
-                        <div style="font-size:32px;font-weight:700;line-height:1">{period}d</div>
-                        <div style="font-size:12px;opacity:0.75;margin-top:2px">Optimal hold period</div>
-                    </div>
-                    <div>
-                        <div style="font-size:32px;font-weight:700;line-height:1">{n_etfs}</div>
-                        <div style="font-size:12px;opacity:0.75;margin-top:2px">ETFs held</div>
-                    </div>
-                    <div>
-                        <div style="font-size:32px;font-weight:700;line-height:1;color:#4ade80">{ret_str}</div>
-                        <div style="font-size:12px;opacity:0.75;margin-top:2px">Best ann. return (trailing 252d)</div>
-                    </div>
-                    <div>
-                        <div style="font-size:15px;font-weight:600;line-height:1.4">
-                            {" · ".join(f'<span style="background:rgba(255,255,255,0.15);'
-                                        f'border-radius:6px;padding:2px 10px">{t}</span>'
-                                        for t in hold_list)}
-                        </div>
-                        <div style="font-size:12px;opacity:0.75;margin-top:4px">Current holdings</div>
-                    </div>
+                <div>
+                    <div style="font-size:32px;font-weight:700;line-height:1">{n_etfs}</div>
+                    <div style="font-size:12px;opacity:0.75;margin-top:4px">ETFs held</div>
+                </div>
+                <div>
+                    <div style="font-size:32px;font-weight:700;line-height:1;color:#4ade80">{ret_str}</div>
+                    <div style="font-size:12px;opacity:0.75;margin-top:4px">Best ann. return (trailing 252d)</div>
+                </div>
+                <div>
+                    <div style="font-size:15px;font-weight:600;line-height:1.6">{holdings_html}</div>
+                    <div style="font-size:12px;opacity:0.75;margin-top:4px">Current holdings</div>
                 </div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """
+        st.markdown(hero_html, unsafe_allow_html=True)
 
     # ── KPI row ───────────────────────────────────────────────────────────────
     try:
