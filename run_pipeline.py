@@ -190,22 +190,41 @@ def run_universe(
     optimal_method = str(port.get("latest_method", "inv_te"))
     best_ret_val   = round(float(port["latest_best_return"]), 6)
     as_of_val      = str(prices.index[-1].date())
+    holdings_str   = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
 
-    # ── Weights — embed config on last row (large dataset, never fails on HF) ─
-    weights_df = port["weights"].copy()
-    config_cols = ["optimal_period", "optimal_n", "target_n", "optimal_method",
-                   "best_ann_return", "as_of", "inception_year"]
-    for col in config_cols:
-        weights_df[col] = np.nan
-    weights_df.loc[weights_df.index[-1], "optimal_period"]  = float(optimal_period)
-    weights_df.loc[weights_df.index[-1], "optimal_n"]       = float(optimal_n)
-    weights_df.loc[weights_df.index[-1], "target_n"]        = float(target_n_val)
-    weights_df.loc[weights_df.index[-1], "optimal_method"]  = optimal_method
-    weights_df.loc[weights_df.index[-1], "best_ann_return"] = best_ret_val
-    weights_df.loc[weights_df.index[-1], "as_of"]           = as_of_val
-    weights_df.loc[weights_df.index[-1], "inception_year"]  = float(inception_year)
-    push(df_to_dataset(weights_df),
-         f"{prefix}_weights", f"update: {label} weights + config")
+    # ── Weights — push clean (no extra columns, no schema corruption) ─────────
+    push(df_to_dataset(port["weights"]),
+         f"{prefix}_weights", f"update: {label} weights")
+
+    # ── Config — push as a plain JSON file to the HF repo (no parquet) ────────
+    import json, tempfile, os
+    config_data = {
+        "optimal_period":  optimal_period,
+        "optimal_n":       optimal_n,
+        "target_n":        target_n_val,
+        "optimal_method":  optimal_method,
+        "best_ann_return": best_ret_val,
+        "as_of":           as_of_val,
+        "holdings":        holdings_str,
+        "inception_year":  inception_year,
+        "is_invested":     not latest_w.empty,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                     delete=False, prefix=f"{prefix}_config_") as f:
+        json.dump(config_data, f)
+        tmp_path = f.name
+
+    api = HfApi()
+    api.upload_file(
+        path_or_fileobj=tmp_path,
+        path_in_repo=f"{prefix}_config.json",
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        token=HF_TOKEN,
+        commit_message=f"update: {label} config snapshot",
+    )
+    os.unlink(tmp_path)
+    print(f"  ✓ Pushed → {prefix}_config.json")
 
     # Inclusion signals
     push(df_to_dataset(signals["inclusion"]),
