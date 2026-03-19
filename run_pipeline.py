@@ -208,30 +208,38 @@ def run_universe(
     push(Dataset.from_pandas(cal, preserve_index=False),
          f"{prefix}_calendar", f"update: {label} calendar year returns")
 
-    # Latest weights snapshot (for Streamlit "current allocation" card)
+    # Latest weights snapshot — actual holdings after inclusion filter
     latest_w = port["latest_weights"]
     if isinstance(latest_w, pd.Series):
         latest_w = latest_w.reset_index()
         latest_w.columns = ["ticker", "weight"]
-    latest_w = latest_w[latest_w["weight"] > 0.001].sort_values("weight", ascending=False)
-    push(Dataset.from_list(latest_w.to_dict("records")),
-         f"{prefix}_latest_weights", f"update: {label} latest weights")
+    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
 
-    # Rolling optimal params (period, n, best_ann_return over time)
+    # Always push something — even empty list is better than stale data
+    push(
+        Dataset.from_list(latest_w.to_dict("records")) if not latest_w.empty
+        else Dataset.from_list([{"ticker": "CASH", "weight": 1.0}]),
+        f"{prefix}_latest_weights", f"update: {label} latest weights"
+    )
+
+    # Rolling optimal params history
     opt_df = port["optimal_params"].reset_index()
     opt_df["date"] = opt_df["date"].dt.strftime("%Y-%m-%d")
     push(Dataset.from_pandas(opt_df, preserve_index=False),
          f"{prefix}_optimal_params", f"update: {label} optimal params history")
 
-    # Latest optimal snapshot — single row for hero box in Streamlit
-    latest_opt = [{
-        "optimal_period":      port["latest_period"],
-        "optimal_n":           port["latest_n"],
-        "best_ann_return":     round(port["latest_best_return"], 6),
-        "holdings":            ",".join(latest_w["ticker"].tolist()),
-        "as_of":               str(prices.index[-1].date()),
+    # Latest optimal snapshot — single row for hero box
+    holdings_str = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
+    latest_opt_record = [{
+        "optimal_period":   port["latest_period"],
+        "optimal_n":        port["latest_n"],          # actual ETFs held after inclusion
+        "target_n":         port.get("latest_target_n", port["latest_n"]),  # optimiser target
+        "best_ann_return":  round(port["latest_best_return"], 6),
+        "holdings":         holdings_str,
+        "as_of":            str(prices.index[-1].date()),
+        "is_invested":      len(latest_w) > 0 and latest_w.iloc[0]["ticker"] != "CASH",
     }]
-    push(Dataset.from_list(latest_opt),
+    push(Dataset.from_list(latest_opt_record),
          f"{prefix}_latest_optimal", f"update: {label} latest optimal snapshot")
 
     print(f"  ✓ {label} pipeline complete.")
