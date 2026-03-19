@@ -125,8 +125,8 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
             }
             return holdings, opt
 
-    except Exception:
-        pass  # Fall through to weights dataset
+    except Exception as e:
+        st.sidebar.warning(f"latest_weights fallback: {e}")
 
     # ── Fallback: derive from large weights dataset (always works) ────────────
     try:
@@ -294,6 +294,10 @@ with st.spinner("Loading …"):
 
 if not data_loaded:
     st.stop()
+
+# Debug expander — shows what's in latest_opt so we can diagnose blank pills
+with st.sidebar.expander("🔍 Debug: config data", expanded=False):
+    st.json(latest_opt if latest_opt else {"status": "empty dict"})
 
 # ════════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — WHAT TO HOLD TODAY  (most prominent)
