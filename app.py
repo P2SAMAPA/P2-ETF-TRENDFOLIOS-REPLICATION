@@ -30,9 +30,20 @@ st.set_page_config(
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+def _get_split(config: str) -> str:
+    """Return the first available split name for a given config."""
+    from datasets import get_dataset_split_names
+    try:
+        splits = get_dataset_split_names(HF_REPO_ID, config, token=HF_TOKEN)
+        return splits[0] if splits else "train"
+    except Exception:
+        return "train"
+
+
 @st.cache_data(ttl=3600)
 def load(config: str) -> pd.DataFrame:
-    ds = load_dataset(HF_REPO_ID, config, split="train", token=HF_TOKEN)
+    split = _get_split(config)
+    ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
     df = ds.to_pandas()
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
@@ -42,14 +53,18 @@ def load(config: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_latest_weights(prefix: str) -> pd.DataFrame:
-    ds = load_dataset(HF_REPO_ID, f"{prefix}_latest_weights", split="train", token=HF_TOKEN)
+    config = f"{prefix}_latest_weights"
+    split  = _get_split(config)
+    ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
     return ds.to_pandas()
 
 
 @st.cache_data(ttl=3600)
 def load_latest_optimal(prefix: str) -> dict:
     try:
-        ds = load_dataset(HF_REPO_ID, f"{prefix}_latest_optimal", split="train", token=HF_TOKEN)
+        config = f"{prefix}_latest_optimal"
+        split  = _get_split(config)
+        ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
         return ds.to_pandas().iloc[0].to_dict()
     except Exception:
         return {}
@@ -58,7 +73,9 @@ def load_latest_optimal(prefix: str) -> dict:
 @st.cache_data(ttl=3600)
 def load_optimal_params(prefix: str) -> pd.DataFrame:
     try:
-        ds = load_dataset(HF_REPO_ID, f"{prefix}_optimal_params", split="train", token=HF_TOKEN)
+        config = f"{prefix}_optimal_params"
+        split  = _get_split(config)
+        ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
         df = ds.to_pandas()
         df["date"] = pd.to_datetime(df["date"])
         return df.set_index("date").sort_index()
@@ -289,13 +306,17 @@ if data_loaded:
 
     # ── KPI row ───────────────────────────────────────────────────────────────
     try:
-        si_row = summary_df[summary_df.index == "Since Inception"].iloc[0]
+        # summary may have Period as index or as a column depending on HF round-trip
+        sdf = summary_df.copy()
+        if "Period" in sdf.columns:
+            sdf = sdf.set_index("Period")
+        si_row = sdf.loc["Since Inception"] if "Since Inception" in sdf.index else sdf.iloc[-1]
         col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Gross Return (SI)", f"{si_row['Composite Gross Return']*100:.2f}%")
-        col2.metric("Net Return (SI)",   f"{si_row['Composite Net Return']*100:.2f}%")
-        col3.metric("Excess Return",     f"{si_row['Excess Return (gross)']*100:+.2f}%")
-        col4.metric("Sharpe Ratio",      f"{si_row['Composite Sharpe']:.2f}")
-        col5.metric("Info Ratio",        f"{si_row['Information Ratio']:.2f}")
+        col1.metric("Gross Return (SI)", f"{float(si_row['Composite Gross Return'])*100:.2f}%")
+        col2.metric("Net Return (SI)",   f"{float(si_row['Composite Net Return'])*100:.2f}%")
+        col3.metric("Excess Return",     f"{float(si_row['Excess Return (gross)'])*100:+.2f}%")
+        col4.metric("Sharpe Ratio",      f"{float(si_row['Composite Sharpe']):.2f}")
+        col5.metric("Info Ratio",        f"{float(si_row['Information Ratio']):.2f}")
     except Exception:
         pass
 
@@ -373,18 +394,22 @@ if data_loaded:
     # ── Performance table ─────────────────────────────────────────────────────
     st.subheader("Annualised Performance Summary")
     if not summary_df.empty:
-        st.markdown(summary_html(summary_df), unsafe_allow_html=True)
+        sdf = summary_df.copy()
+        if "Period" in sdf.columns:
+            sdf = sdf.set_index("Period")
+        st.markdown(summary_html(sdf), unsafe_allow_html=True)
 
     # ── Calendar year ─────────────────────────────────────────────────────────
     st.subheader("Calendar Year Returns")
     if not calendar_df.empty:
         try:
             cal_display = calendar_df.copy()
+            if "Year" in cal_display.columns:
+                cal_display = cal_display.set_index("Year")
             for col in cal_display.columns:
-                if col != "Year":
-                    cal_display[col] = cal_display[col].map(
-                        lambda v: f"{v*100:+.2f}%" if pd.notna(v) else "—"
-                    )
-            st.dataframe(cal_display.set_index("Year"), use_container_width=True)
+                cal_display[col] = cal_display[col].map(
+                    lambda v: f"{v*100:+.2f}%" if pd.notna(v) else "—"
+                )
+            st.dataframe(cal_display.sort_index(ascending=False), use_container_width=True)
         except Exception:
             st.dataframe(calendar_df, use_container_width=True)
