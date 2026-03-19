@@ -78,29 +78,29 @@ def load(config: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900)
-def load_latest_optimal(prefix: str) -> dict:
-    config = f"{prefix}_latest_optimal"
-    try:
-        split = _get_split(config)
-        ds    = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
-        df    = ds.to_pandas()
-        if not df.empty:
-            return df.iloc[0].to_dict()
-    except Exception as e:
-        st.warning(f"Could not load {config}: {e}")
-    return {}
-
-
-@st.cache_data(ttl=3600)
 def load_latest_weights(prefix: str) -> pd.DataFrame:
+    """Loads holdings + embedded optimal config from latest_weights dataset."""
     try:
         config = f"{prefix}_latest_weights"
         split  = _get_split(config)
         ds     = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
         df     = ds.to_pandas()
-        return df if not df.empty else pd.DataFrame(columns=["ticker", "weight"])
-    except Exception:
-        return pd.DataFrame(columns=["ticker", "weight"])
+        return df if not df.empty else pd.DataFrame()
+    except Exception as e:
+        st.warning(f"Could not load {config}: {e}")
+        return pd.DataFrame()
+
+
+def extract_optimal(df: pd.DataFrame) -> dict:
+    """Extract optimal config embedded in latest_weights dataset (first row)."""
+    if df.empty:
+        return {}
+    row = df.iloc[0]
+    result = {}
+    for col in ["optimal_period", "optimal_n", "target_n", "best_ann_return", "holdings", "as_of", "is_invested"]:
+        if col in df.columns:
+            result[col] = row[col]
+    return result
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -216,8 +216,8 @@ with st.spinner("Loading …"):
         rolling_df   = load(f"{prefix}_rolling")
         summary_df   = load(f"{prefix}_summary")
         calendar_df  = load(f"{prefix}_calendar")
-        latest_opt   = load_latest_optimal(prefix)
         latest_wts   = load_latest_weights(prefix)
+        latest_opt   = extract_optimal(latest_wts)
         data_loaded  = True
     except Exception as e:
         st.error(f"Could not load data: {e}")
@@ -247,11 +247,12 @@ best_ret    = latest_opt.get("best_ann_return")
 as_of       = _safe(latest_opt.get("as_of"))
 ret_str     = _safe(best_ret, lambda v: f"{float(v)*100:.2f}%")
 
-# Holdings from latest_weights — exclude CASH sentinel
+# Holdings — filter out padding rows (empty ticker) and CASH sentinel
 if not latest_wts.empty and "ticker" in latest_wts.columns:
     holdings = latest_wts[
         (latest_wts["weight"] > 1e-6) &
-        (latest_wts["ticker"] != "CASH")
+        (latest_wts["ticker"] != "CASH") &
+        (latest_wts["ticker"].str.strip() != "")
     ].sort_values("weight", ascending=False)
 else:
     holdings = pd.DataFrame(columns=["ticker", "weight"])
