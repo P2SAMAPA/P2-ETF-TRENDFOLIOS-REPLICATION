@@ -211,56 +211,66 @@ if not data_loaded:
 st.markdown("---")
 
 # Gather data
-opt_period   = latest_opt.get("optimal_period", "—")
-opt_n        = latest_opt.get("optimal_n", "—")
-best_ret     = latest_opt.get("best_ann_return", None)
-as_of        = latest_opt.get("as_of", "")
-ret_str      = f"{float(best_ret)*100:.2f}%" if best_ret and not pd.isna(float(best_ret)) else "—"
+opt_period  = latest_opt.get("optimal_period", "—")
+opt_n       = latest_opt.get("optimal_n", "—")
+target_n    = latest_opt.get("target_n", opt_n)
+best_ret    = latest_opt.get("best_ann_return", None)
+as_of       = latest_opt.get("as_of", "")
+is_invested = latest_opt.get("is_invested", True)
+ret_str     = f"{float(best_ret)*100:.2f}%" if best_ret and not pd.isna(float(best_ret)) else "—"
 
-# Holdings: use latest_weights (top N by weight, already filtered by pipeline)
+# Holdings from latest_weights — exclude CASH sentinel
 if not latest_wts.empty and "ticker" in latest_wts.columns:
-    holdings = (
-        latest_wts[latest_wts["weight"] > 0]
-        .sort_values("weight", ascending=False)
-        .head(int(opt_n) if str(opt_n).isdigit() else 3)
-    )
+    holdings = latest_wts[
+        (latest_wts["weight"] > 1e-6) &
+        (latest_wts["ticker"] != "CASH")
+    ].sort_values("weight", ascending=False)
 else:
     holdings = pd.DataFrame(columns=["ticker", "weight"])
 
-# Build holding cards HTML
-pill_bg   = "rgba(255,255,255,0.18)"
-card_html = ""
-for _, row in holdings.iterrows():
-    ticker = row["ticker"]
-    weight = row["weight"]
-    card_html += f"""
-    <div style="background:{pill_bg};border-radius:10px;padding:14px 22px;
-                display:inline-block;margin:6px 8px;text-align:center;min-width:90px">
-        <div style="font-size:22px;font-weight:700;letter-spacing:1px">{ticker}</div>
-        <div style="font-size:13px;opacity:0.8;margin-top:2px">{weight*100:.1f}%</div>
+is_invested = len(holdings) > 0
+
+# ── ETF cards ─────────────────────────────────────────────────────────────────
+if is_invested:
+    card_html = ""
+    for _, row in holdings.iterrows():
+        card_html += f"""
+        <div style="background:#f0f4ff;border:2px solid #2563EB;border-radius:12px;
+                    padding:18px 28px;display:inline-block;margin:6px 8px;
+                    text-align:center;min-width:110px">
+            <div style="font-size:24px;font-weight:800;color:#1e3a8a;
+                        letter-spacing:1px">{row['ticker']}</div>
+            <div style="font-size:14px;color:#2563EB;font-weight:600;
+                        margin-top:4px">{row['weight']*100:.1f}%</div>
+        </div>"""
+else:
+    card_html = """
+    <div style="background:#fef9c3;border:2px solid #ca8a04;border-radius:12px;
+                padding:16px 24px;display:inline-block;margin:6px 0;color:#713f12">
+        <span style="font-size:18px;margin-right:8px">⚠️</span>
+        <span style="font-size:15px;font-weight:600">
+            No signal — all ETFs excluded by momentum/trend filter. Stay in cash.
+        </span>
     </div>"""
 
-if not card_html:
-    card_html = '<div style="font-size:16px;opacity:0.7;padding:10px">No holdings signal — all assets excluded by momentum/trend filter</div>'
-
-# Config pills
-config_style = "background:rgba(255,255,255,0.12);border-radius:6px;padding:3px 12px;font-size:13px;margin-right:10px"
-config_html  = (
-    f'<span style="{config_style}">⏱ Hold {opt_period}d</span>'
-    f'<span style="{config_style}">📦 {opt_n} ETF(s)</span>'
-    f'<span style="{config_style}">📈 {ret_str} ann. return (trailing 252d)</span>'
-    f'<span style="{config_style}">📅 Signals as of {as_of}</span>'
+# ── Config footer ──────────────────────────────────────────────────────────────
+pill = "background:#e8f0fe;border-radius:6px;padding:4px 12px;font-size:12px;color:#1e40af;margin-right:8px;display:inline-block;margin-bottom:4px"
+config_html = (
+    f'<span style="{pill}">⏱ Hold {opt_period}d</span>'
+    f'<span style="{pill}">📦 Target {target_n} ETF(s) · Actual {opt_n}</span>'
+    f'<span style="{pill}">📈 {ret_str} best ann. return (trailing 252d)</span>'
+    f'<span style="{pill}">📅 Signals as of {as_of}</span>'
 )
 
 action_html = f"""
-<div style="background:linear-gradient(135deg,#0f2444,#1a3a8f);
-            border-radius:14px;padding:24px 28px;margin:8px 0 20px 0;color:white;">
-    <div style="font-size:11px;letter-spacing:3px;opacity:0.6;
-                text-transform:uppercase;margin-bottom:14px;">
+<div style="background:#ffffff;border:2px solid #2563EB;border-radius:14px;
+            padding:24px 28px;margin:8px 0 24px 0;">
+    <div style="font-size:11px;letter-spacing:3px;color:#6b7280;
+                text-transform:uppercase;margin-bottom:16px;font-weight:600">
         🎯 &nbsp;Action for {today_label} — Hold at Market Open
     </div>
-    <div style="margin-bottom:18px">{card_html}</div>
-    <div style="border-top:1px solid rgba(255,255,255,0.12);padding-top:12px">
+    <div style="margin-bottom:20px">{card_html}</div>
+    <div style="border-top:1px solid #e5e7eb;padding-top:12px">
         {config_html}
     </div>
 </div>
