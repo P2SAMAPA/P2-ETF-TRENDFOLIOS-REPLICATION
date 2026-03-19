@@ -122,21 +122,28 @@ def performance_table(
     """
     port_returns_net = apply_fee(port_returns_gross)
 
+    def tail_n_days(s: pd.Series, n: int) -> pd.Series:
+        """Return last n calendar days of a series using .loc."""
+        if s.empty:
+            return s
+        cutoff = s.index[-1] - pd.Timedelta(days=n)
+        return s.loc[s.index >= cutoff]
+
     periods = {
-        "1-Year":        port_returns_gross.last("252D"),
-        "3-Year":        port_returns_gross.last("756D"),
-        "5-Year":        port_returns_gross.last("1260D"),
-        "10-Year":       port_returns_gross.last("2520D"),
+        "1-Year":          tail_n_days(port_returns_gross, 365),
+        "3-Year":          tail_n_days(port_returns_gross, 365 * 3),
+        "5-Year":          tail_n_days(port_returns_gross, 365 * 5),
+        "10-Year":         tail_n_days(port_returns_gross, 365 * 10),
         "Since Inception": port_returns_gross,
     }
     periods_net = {
         k: apply_fee(v) for k, v in periods.items()
     }
     bench_periods = {
-        "1-Year":        bench_returns.last("252D"),
-        "3-Year":        bench_returns.last("756D"),
-        "5-Year":        bench_returns.last("1260D"),
-        "10-Year":       bench_returns.last("2520D"),
+        "1-Year":          tail_n_days(bench_returns, 365),
+        "3-Year":          tail_n_days(bench_returns, 365 * 3),
+        "5-Year":          tail_n_days(bench_returns, 365 * 5),
+        "10-Year":         tail_n_days(bench_returns, 365 * 10),
         "Since Inception": bench_returns,
     }
 
