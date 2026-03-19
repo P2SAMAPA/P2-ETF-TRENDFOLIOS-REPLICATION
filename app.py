@@ -24,6 +24,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Global font sizing ────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* Body text */
+    html, body, [class*="css"] { font-size: 17px !important; }
+    /* Metric labels and values */
+    [data-testid="stMetricLabel"] { font-size: 16px !important; }
+    [data-testid="stMetricValue"] { font-size: 32px !important; font-weight: 700 !important; }
+    /* Subheaders */
+    h2, h3 { font-size: 22px !important; }
+    /* Sidebar text */
+    [data-testid="stSidebar"] { font-size: 15px !important; }
+    /* Table text */
+    table td, table th { font-size: 15px !important; }
+    /* Dataframe */
+    .stDataFrame { font-size: 15px !important; }
+    /* Caption */
+    [data-testid="stCaptionContainer"] { font-size: 15px !important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ── Colour palette ────────────────────────────────────────────────────────────
 
 BLUE       = "#2563EB"
@@ -56,16 +77,18 @@ def load(config: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def load_latest_optimal(prefix: str) -> dict:
+    config = f"{prefix}_latest_optimal"
     try:
-        config = f"{prefix}_latest_optimal"
-        split  = _get_split(config)
-        ds     = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
-        df     = ds.to_pandas()
-        return df.iloc[0].to_dict() if not df.empty else {}
-    except Exception:
-        return {}
+        split = _get_split(config)
+        ds    = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
+        df    = ds.to_pandas()
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception as e:
+        st.warning(f"Could not load {config}: {e}")
+    return {}
 
 
 @st.cache_data(ttl=3600)
@@ -210,14 +233,19 @@ if not data_loaded:
 
 st.markdown("---")
 
-# Gather data
-opt_period  = latest_opt.get("optimal_period", "—")
-opt_n       = latest_opt.get("optimal_n", "—")
-target_n    = latest_opt.get("target_n", opt_n)
-best_ret    = latest_opt.get("best_ann_return", None)
-as_of       = latest_opt.get("as_of", "")
-is_invested = latest_opt.get("is_invested", True)
-ret_str     = f"{float(best_ret)*100:.2f}%" if best_ret and not pd.isna(float(best_ret)) else "—"
+# Gather data — coerce types robustly from parquet round-trip
+def _safe(v, fmt=str, fallback="—"):
+    try:
+        return fmt(v) if v is not None and str(v) not in ("nan", "None", "") else fallback
+    except Exception:
+        return fallback
+
+opt_period  = _safe(latest_opt.get("optimal_period"), lambda v: f"{int(float(v))}")
+opt_n       = _safe(latest_opt.get("optimal_n"),       lambda v: f"{int(float(v))}")
+target_n    = _safe(latest_opt.get("target_n"),        lambda v: f"{int(float(v))}", opt_n)
+best_ret    = latest_opt.get("best_ann_return")
+as_of       = _safe(latest_opt.get("as_of"))
+ret_str     = _safe(best_ret, lambda v: f"{float(v)*100:.2f}%")
 
 # Holdings from latest_weights — exclude CASH sentinel
 if not latest_wts.empty and "ticker" in latest_wts.columns:
@@ -235,26 +263,30 @@ if is_invested:
     card_html = ""
     for _, row in holdings.iterrows():
         card_html += f"""
-        <div style="background:#f0f4ff;border:2px solid #2563EB;border-radius:12px;
-                    padding:18px 28px;display:inline-block;margin:6px 8px;
-                    text-align:center;min-width:110px">
-            <div style="font-size:24px;font-weight:800;color:#1e3a8a;
-                        letter-spacing:1px">{row['ticker']}</div>
-            <div style="font-size:14px;color:#2563EB;font-weight:600;
-                        margin-top:4px">{row['weight']*100:.1f}%</div>
+        <div style="background:#f0f4ff;border:2.5px solid #2563EB;border-radius:14px;
+                    padding:22px 36px;display:inline-block;margin:8px 10px;
+                    text-align:center;min-width:130px">
+            <div style="font-size:32px;font-weight:800;color:#1e3a8a;
+                        letter-spacing:2px">{row['ticker']}</div>
+            <div style="font-size:18px;color:#2563EB;font-weight:700;
+                        margin-top:6px">{row['weight']*100:.1f}%</div>
         </div>"""
 else:
     card_html = """
     <div style="background:#fef9c3;border:2px solid #ca8a04;border-radius:12px;
-                padding:16px 24px;display:inline-block;margin:6px 0;color:#713f12">
-        <span style="font-size:18px;margin-right:8px">⚠️</span>
-        <span style="font-size:15px;font-weight:600">
+                padding:20px 28px;display:inline-block;margin:6px 0;color:#713f12">
+        <span style="font-size:22px;margin-right:10px">⚠️</span>
+        <span style="font-size:18px;font-weight:600">
             No signal — all ETFs excluded by momentum/trend filter. Stay in cash.
         </span>
     </div>"""
 
 # ── Config footer ──────────────────────────────────────────────────────────────
-pill = "background:#e8f0fe;border-radius:6px;padding:4px 12px;font-size:12px;color:#1e40af;margin-right:8px;display:inline-block;margin-bottom:4px"
+pill = (
+    "background:#e8f0fe;border-radius:8px;padding:8px 16px;"
+    "font-size:15px;color:#1e40af;font-weight:600;"
+    "margin-right:10px;display:inline-block;margin-bottom:6px"
+)
 config_html = (
     f'<span style="{pill}">⏱ Hold {opt_period}d</span>'
     f'<span style="{pill}">📦 Target {target_n} ETF(s) · Actual {opt_n}</span>'
@@ -263,14 +295,14 @@ config_html = (
 )
 
 action_html = f"""
-<div style="background:#ffffff;border:2px solid #2563EB;border-radius:14px;
-            padding:24px 28px;margin:8px 0 24px 0;">
-    <div style="font-size:11px;letter-spacing:3px;color:#6b7280;
-                text-transform:uppercase;margin-bottom:16px;font-weight:600">
+<div style="background:#ffffff;border:2.5px solid #2563EB;border-radius:16px;
+            padding:28px 32px;margin:8px 0 28px 0;">
+    <div style="font-size:13px;letter-spacing:3px;color:#6b7280;
+                text-transform:uppercase;margin-bottom:20px;font-weight:700">
         🎯 &nbsp;Action for {today_label} — Hold at Market Open
     </div>
-    <div style="margin-bottom:20px">{card_html}</div>
-    <div style="border-top:1px solid #e5e7eb;padding-top:12px">
+    <div style="margin-bottom:24px">{card_html}</div>
+    <div style="border-top:1.5px solid #e5e7eb;padding-top:14px">
         {config_html}
     </div>
 </div>
