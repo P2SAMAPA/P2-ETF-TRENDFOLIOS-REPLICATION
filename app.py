@@ -90,6 +90,13 @@ def growth_chart(growth_df: pd.DataFrame, title: str, port_label: str, bench_lab
     return fig
 
 
+def hex_to_rgba(hex_color: str, alpha: float = 0.13) -> str:
+    """Convert #RRGGBB to rgba(r,g,b,alpha) for Plotly fillcolor."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 def rolling_chart(rolling_df: pd.DataFrame, title: str):
     fig = go.Figure()
     colours = {"rolling_1y": BLUE, "rolling_3y": AMBER, "rolling_5y": GREEN}
@@ -102,7 +109,7 @@ def rolling_chart(rolling_df: pd.DataFrame, title: str):
             name=labels[col],
             line=dict(color=colours[col], width=1.5),
             fill="tozeroy",
-            fillcolor=colours[col] + "22",
+            fillcolor=hex_to_rgba(colours[col]),
         ))
     fig.add_hline(y=0, line_dash="dash", line_color=GRAY, line_width=1)
     fig.update_layout(
