@@ -46,6 +46,26 @@ def load_latest_weights(prefix: str) -> pd.DataFrame:
     return ds.to_pandas()
 
 
+@st.cache_data(ttl=3600)
+def load_latest_optimal(prefix: str) -> dict:
+    try:
+        ds = load_dataset(HF_REPO_ID, f"{prefix}_latest_optimal", split="train", token=HF_TOKEN)
+        return ds.to_pandas().iloc[0].to_dict()
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600)
+def load_optimal_params(prefix: str) -> pd.DataFrame:
+    try:
+        ds = load_dataset(HF_REPO_ID, f"{prefix}_optimal_params", split="train", token=HF_TOKEN)
+        df = ds.to_pandas()
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date").sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
 # ── Colour palette ────────────────────────────────────────────────────────────
 
 BLUE   = "#2563EB"
@@ -53,6 +73,9 @@ GRAY   = "#94A3B8"
 GREEN  = "#16A34A"
 RED    = "#DC2626"
 AMBER  = "#D97706"
+
+CANDIDATE_PERIODS = [3, 5, 10, 15]
+CANDIDATE_SIZES   = [1, 2, 3]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -199,33 +222,80 @@ prefix      = "equity" if universe == "Equity" else "fixed_income"
 bench_label = "SPY"    if universe == "Equity" else "AGG"
 
 st.title(f"TrendFolios® — {universe} Strategy")
-st.caption(f"Benchmark: {bench_label} | Rebalance: Biweekly | Fee: 0.55% p.a.")
+st.caption(f"Benchmark: {bench_label} | Rolling optimised holding period & portfolio size | Fee: 0.55% p.a.")
 
 # Load data
 with st.spinner("Loading data from HuggingFace …"):
     try:
-        growth_df  = load(f"{prefix}_growth")
-        rolling_df = load(f"{prefix}_rolling")
-        summary_df = load(f"{prefix}_summary")
-        calendar_df = load(f"{prefix}_calendar")
-        latest_wts  = load_latest_weights(prefix)
+        growth_df    = load(f"{prefix}_growth")
+        rolling_df   = load(f"{prefix}_rolling")
+        summary_df   = load(f"{prefix}_summary")
+        calendar_df  = load(f"{prefix}_calendar")
+        latest_wts   = load_latest_weights(prefix)
         inclusion_df = load(f"{prefix}_inclusion")
-        data_loaded = True
+        latest_opt   = load_latest_optimal(prefix)
+        opt_params   = load_optimal_params(prefix)
+        data_loaded  = True
     except Exception as e:
         st.error(f"Could not load data: {e}")
-        st.info("Run the seed script and weekly pipeline first.")
+        st.info("Run the seed script and daily pipeline first.")
         data_loaded = False
 
 if data_loaded:
+    # ── Hero box — optimal strategy snapshot ─────────────────────────────────
+    if latest_opt:
+        period    = latest_opt.get("optimal_period", "—")
+        n_etfs    = latest_opt.get("optimal_n", "—")
+        best_ret  = latest_opt.get("best_ann_return", None)
+        holdings  = latest_opt.get("holdings", "")
+        as_of     = latest_opt.get("as_of", "")
+        ret_str   = f"{best_ret*100:.2f}%" if best_ret and not pd.isna(best_ret) else "—"
+        hold_list = holdings.split(",") if holdings else []
+
+        st.markdown(
+            f"""
+            <div style="background:linear-gradient(135deg,#1e3a5f,#1e40af);
+                        border-radius:12px;padding:20px 28px;margin-bottom:16px;color:white;">
+                <div style="font-size:11px;letter-spacing:2px;opacity:0.7;
+                            text-transform:uppercase;margin-bottom:6px;">
+                    🤖 Model Optimal Configuration — as of {as_of}
+                </div>
+                <div style="display:flex;gap:48px;flex-wrap:wrap;align-items:center">
+                    <div>
+                        <div style="font-size:32px;font-weight:700;line-height:1">{period}d</div>
+                        <div style="font-size:12px;opacity:0.75;margin-top:2px">Optimal hold period</div>
+                    </div>
+                    <div>
+                        <div style="font-size:32px;font-weight:700;line-height:1">{n_etfs}</div>
+                        <div style="font-size:12px;opacity:0.75;margin-top:2px">ETFs held</div>
+                    </div>
+                    <div>
+                        <div style="font-size:32px;font-weight:700;line-height:1;color:#4ade80">{ret_str}</div>
+                        <div style="font-size:12px;opacity:0.75;margin-top:2px">Best ann. return (trailing 252d)</div>
+                    </div>
+                    <div>
+                        <div style="font-size:15px;font-weight:600;line-height:1.4">
+                            {" · ".join(f'<span style="background:rgba(255,255,255,0.15);'
+                                        f'border-radius:6px;padding:2px 10px">{t}</span>'
+                                        for t in hold_list)}
+                        </div>
+                        <div style="font-size:12px;opacity:0.75;margin-top:4px">Current holdings</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # ── KPI row ───────────────────────────────────────────────────────────────
     try:
-        since_inception = summary_df[summary_df.index == "Since Inception"].iloc[0]
+        si_row = summary_df[summary_df.index == "Since Inception"].iloc[0]
         col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Gross Return (SI)", f"{since_inception['Composite Gross Return']*100:.2f}%")
-        col2.metric("Net Return (SI)",   f"{since_inception['Composite Net Return']*100:.2f}%")
-        col3.metric("Excess Return",     f"{since_inception['Excess Return (gross)']*100:+.2f}%")
-        col4.metric("Sharpe Ratio",      f"{since_inception['Composite Sharpe']:.2f}")
-        col5.metric("Info Ratio",        f"{since_inception['Information Ratio']:.2f}")
+        col1.metric("Gross Return (SI)", f"{si_row['Composite Gross Return']*100:.2f}%")
+        col2.metric("Net Return (SI)",   f"{si_row['Composite Net Return']*100:.2f}%")
+        col3.metric("Excess Return",     f"{si_row['Excess Return (gross)']*100:+.2f}%")
+        col4.metric("Sharpe Ratio",      f"{si_row['Composite Sharpe']:.2f}")
+        col5.metric("Info Ratio",        f"{si_row['Information Ratio']:.2f}")
     except Exception:
         pass
 
@@ -244,6 +314,41 @@ if data_loaded:
             use_container_width=True,
         )
 
+    # ── Optimal params history ────────────────────────────────────────────────
+    if not opt_params.empty:
+        st.subheader("Rolling Optimal Configuration History")
+        col_p, col_n = st.columns(2)
+        with col_p:
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Scatter(
+                x=opt_params.index, y=opt_params["optimal_period"],
+                mode="lines", name="Optimal Period",
+                line=dict(color=BLUE, width=2),
+                fill="tozeroy", fillcolor=hex_to_rgba(BLUE, 0.08),
+            ))
+            fig_p.update_layout(
+                title="Optimal Holding Period (days)",
+                yaxis=dict(tickvals=CANDIDATE_PERIODS, title="Days"),
+                margin=dict(l=0, r=0, t=40, b=0),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_p, use_container_width=True)
+        with col_n:
+            fig_n = go.Figure()
+            fig_n.add_trace(go.Scatter(
+                x=opt_params.index, y=opt_params["optimal_n"],
+                mode="lines", name="Optimal N",
+                line=dict(color=AMBER, width=2),
+                fill="tozeroy", fillcolor=hex_to_rgba(AMBER, 0.08),
+            ))
+            fig_n.update_layout(
+                title="Optimal Number of ETFs Held",
+                yaxis=dict(tickvals=CANDIDATE_SIZES, title="N ETFs"),
+                margin=dict(l=0, r=0, t=40, b=0),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_n, use_container_width=True)
+
     # ── Current allocation ────────────────────────────────────────────────────
     st.subheader("Current Portfolio Allocation")
     col_w, col_inc = st.columns([1, 2])
@@ -258,7 +363,6 @@ if data_loaded:
         try:
             inc_recent = inclusion_df.tail(60).T
             inc_recent.columns = [str(d.date()) for d in inc_recent.columns]
-            # Style: green=1, red=0
             styled = inc_recent.style.applymap(
                 lambda v: "background-color:#bbf7d0" if v == 1 else "background-color:#fecaca"
             ).format("{:.0f}")
