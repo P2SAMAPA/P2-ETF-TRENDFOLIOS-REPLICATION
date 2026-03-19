@@ -1,0 +1,28 @@
+name: Seed Raw Data
+
+on:
+  workflow_dispatch:  # manual trigger only — run once to initialise the dataset
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas datasets huggingface_hub
+
+      - name: Run seed script
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python seed_data.py
