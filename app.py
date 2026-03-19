@@ -66,7 +66,7 @@ def _get_split(config: str) -> str:
         return "train"
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def load(config: str) -> pd.DataFrame:
     split = _get_split(config)
     ds    = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
@@ -78,29 +78,49 @@ def load(config: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900)
-def load_latest_weights(prefix: str) -> pd.DataFrame:
-    """Loads holdings + embedded optimal config from latest_weights dataset."""
+def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Derives current holdings and optimal config from two large reliable datasets:
+    - {prefix}_weights      : full weight history → last row = current weights
+    - {prefix}_optimal_params : full optimiser history → last row = current config
+
+    Avoids the small-parquet HF generation error that plagues latest_weights.
+    """
+    holdings = pd.DataFrame(columns=["ticker", "weight"])
+    opt      = {}
+
+    # ── Current weights from last row of full weights dataset ─────────────────
     try:
-        config = f"{prefix}_latest_weights"
-        split  = _get_split(config)
-        ds     = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
-        df     = ds.to_pandas()
-        return df if not df.empty else pd.DataFrame()
+        weights_df = load(f"{prefix}_weights")
+        if not weights_df.empty:
+            last_row = weights_df.iloc[-1]
+            as_of    = str(weights_df.index[-1].date())
+            w = last_row[last_row > 1e-6].sort_values(ascending=False)
+            if not w.empty:
+                holdings = pd.DataFrame({
+                    "ticker": w.index.tolist(),
+                    "weight": w.values.tolist(),
+                })
     except Exception as e:
-        st.warning(f"Could not load {config}: {e}")
-        return pd.DataFrame()
+        st.warning(f"Could not derive holdings from {prefix}_weights: {e}")
 
+    # ── Optimal config from last row of optimal_params dataset ────────────────
+    try:
+        opt_df = load(f"{prefix}_optimal_params")
+        if not opt_df.empty:
+            last_opt = opt_df.iloc[-1]
+            opt = {
+                "optimal_period":  int(float(last_opt.get("optimal_period", 0))),
+                "optimal_n":       len(holdings),   # actual N from weights
+                "target_n":        int(float(last_opt.get("optimal_n", 0))),
+                "best_ann_return": float(last_opt.get("best_ann_return", float("nan"))),
+                "as_of":           str(opt_df.index[-1].date()),
+                "is_invested":     len(holdings) > 0,
+            }
+    except Exception as e:
+        st.warning(f"Could not load {prefix}_optimal_params: {e}")
 
-def extract_optimal(df: pd.DataFrame) -> dict:
-    """Extract optimal config embedded in latest_weights dataset (first row)."""
-    if df.empty:
-        return {}
-    row = df.iloc[0]
-    result = {}
-    for col in ["optimal_period", "optimal_n", "target_n", "best_ann_return", "holdings", "as_of", "is_invested"]:
-        if col in df.columns:
-            result[col] = row[col]
-    return result
+    return holdings, opt
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -213,12 +233,11 @@ st.caption(
 # Load all data
 with st.spinner("Loading …"):
     try:
-        rolling_df   = load(f"{prefix}_rolling")
-        summary_df   = load(f"{prefix}_summary")
-        calendar_df  = load(f"{prefix}_calendar")
-        latest_wts   = load_latest_weights(prefix)
-        latest_opt   = extract_optimal(latest_wts)
-        data_loaded  = True
+        rolling_df          = load(f"{prefix}_rolling")
+        summary_df          = load(f"{prefix}_summary")
+        calendar_df         = load(f"{prefix}_calendar")
+        latest_wts, latest_opt = load_holdings_and_config(prefix)
+        data_loaded         = True
     except Exception as e:
         st.error(f"Could not load data: {e}")
         st.info("Run the seed script and daily pipeline first.")
@@ -236,7 +255,7 @@ st.markdown("---")
 # Gather data — coerce types robustly from parquet round-trip
 def _safe(v, fmt=str, fallback="—"):
     try:
-        return fmt(v) if v is not None and str(v) not in ("nan", "None", "") else fallback
+        return fmt(v) if v is not None and str(v) not in ("nan", "None", "", "0") else fallback
     except Exception:
         return fallback
 
@@ -247,16 +266,8 @@ best_ret    = latest_opt.get("best_ann_return")
 as_of       = _safe(latest_opt.get("as_of"))
 ret_str     = _safe(best_ret, lambda v: f"{float(v)*100:.2f}%")
 
-# Holdings — filter out padding rows (empty ticker) and CASH sentinel
-if not latest_wts.empty and "ticker" in latest_wts.columns:
-    holdings = latest_wts[
-        (latest_wts["weight"] > 1e-6) &
-        (latest_wts["ticker"] != "CASH") &
-        (latest_wts["ticker"].str.strip() != "")
-    ].sort_values("weight", ascending=False)
-else:
-    holdings = pd.DataFrame(columns=["ticker", "weight"])
-
+# Holdings already filtered and sorted by load_holdings_and_config
+holdings    = latest_wts
 is_invested = len(holdings) > 0
 
 # ── ETF cards ─────────────────────────────────────────────────────────────────
