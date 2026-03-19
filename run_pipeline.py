@@ -39,6 +39,12 @@ FIXED_INCOME_ETFS = [
 
 BENCHMARKS = {"equity": "SPY", "fixed_income": "AGG"}
 
+# Hard start dates — enforced to ensure meaningful full-universe coverage
+UNIVERSE_START = {
+    "equity":       "2005-01-01",
+    "fixed_income": "2007-01-01",
+}
+
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
@@ -120,10 +126,12 @@ def run_universe(
     tickers: list[str],
     benchmark_ticker: str,
     label: str,
+    start_date: str,
 ):
     """Run signals → portfolio → backtest for one universe (equity or FI)."""
     print(f"\n{'='*60}")
     print(f"  Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
+    print(f"  Hard start date: {start_date}")
     print(f"{'='*60}")
 
     # Filter to tickers that actually exist in prices
@@ -132,13 +140,18 @@ def run_universe(
     if missing:
         print(f"  ⚠ Missing tickers skipped: {missing}")
 
-    prices    = prices_all[available].dropna(how="all")
-    bench     = prices_all[benchmark_ticker].dropna()
+    prices = prices_all[available].dropna(how="all")
+    bench  = prices_all[benchmark_ticker].dropna()
 
-    # Align to common dates
+    # Align to common dates AND enforce hard start date
     common = prices.index.intersection(bench.index)
+    common = common[common >= pd.Timestamp(start_date)]
     prices = prices.loc[common]
     bench  = bench.loc[common]
+
+    inception_year = pd.Timestamp(start_date).year
+    print(f"  → Data from {prices.index[0].date()} to {prices.index[-1].date()} "
+          f"({len(prices)} trading days)")
 
     # ── Signals ──────────────────────────────────────────────────────────────
     print("  Computing signals …")
@@ -238,6 +251,7 @@ def run_universe(
         r["holdings"]        = holdings_str
         r["as_of"]           = as_of_val
         r["is_invested"]     = is_invested
+        r["inception_year"]  = inception_year
 
     # Pad to minimum 3 rows to avoid HF parquet single-row generation errors
     while len(rows) < 3:
@@ -245,7 +259,8 @@ def run_universe(
             "ticker": "", "weight": 0.0,
             "optimal_period": optimal_period, "optimal_n": optimal_n,
             "target_n": target_n_val, "best_ann_return": best_ret_val,
-            "holdings": holdings_str, "as_of": as_of_val, "is_invested": is_invested,
+            "holdings": holdings_str, "as_of": as_of_val,
+            "is_invested": is_invested, "inception_year": inception_year,
         })
 
     push(Dataset.from_list(rows),
@@ -285,6 +300,7 @@ def main():
         tickers          = EQUITY_ETFS,
         benchmark_ticker = BENCHMARKS["equity"],
         label            = "equity",
+        start_date       = UNIVERSE_START["equity"],
     )
 
     fi_summary = run_universe(
@@ -292,6 +308,7 @@ def main():
         tickers          = FIXED_INCOME_ETFS,
         benchmark_ticker = BENCHMARKS["fixed_income"],
         label            = "fixed_income",
+        start_date       = UNIVERSE_START["fixed_income"],
     )
 
     print("\n" + "=" * 60)
