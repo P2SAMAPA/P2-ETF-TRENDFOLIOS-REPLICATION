@@ -1,9 +1,10 @@
-name: Weekly Pipeline Run
+name: Daily Pipeline Run
 
 on:
   schedule:
-    - cron: "0 2 * * 1"  # every Monday at 02:00 UTC (after US market close Friday)
-  workflow_dispatch:       # allow manual trigger
+    # Runs Mon–Fri at 22:30 UTC (after 4:00 PM ET close + 1hr buffer, runs after daily_data_update)
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:  # allow manual trigger
 
 jobs:
   run-pipeline:
