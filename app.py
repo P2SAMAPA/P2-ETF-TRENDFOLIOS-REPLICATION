@@ -308,19 +308,36 @@ def _safe(v, fmt=str, fallback="—"):
     except Exception:
         return fallback
 
-opt_period   = latest_opt.get("optimal_period", 0) or "—"
-opt_n        = latest_opt.get("optimal_n", 0) or "—"
-target_n     = latest_opt.get("target_n", opt_n) or opt_n
+opt_period   = latest_opt.get("optimal_period")
+opt_n        = latest_opt.get("optimal_n")
+target_n     = latest_opt.get("target_n", opt_n)
 best_ret     = latest_opt.get("best_ann_return")
-as_of        = latest_opt.get("as_of", "") or "—"
+as_of        = latest_opt.get("as_of", "")
 raw_method   = latest_opt.get("optimal_method", "inv_te")
 method_label = "Inverse-TE weighting" if raw_method == "inv_te" else "Momentum-rank weighting"
 method_emoji = "⚖️" if raw_method == "inv_te" else "🚀"
 
-try:
-    ret_str = f"{float(best_ret)*100:.2f}%" if best_ret and not np.isnan(float(best_ret)) else "—"
-except Exception:
-    ret_str = "—"
+def _fmt_int(v, fallback="—") -> str:
+    """Format an int value, showing fallback if None/0/nan."""
+    try:
+        i = int(float(v))
+        return str(i) if i > 0 else fallback
+    except Exception:
+        return fallback
+
+def _fmt_pct(v, fallback="—") -> str:
+    """Format a float as percentage, showing fallback if None/nan."""
+    try:
+        f = float(v)
+        return f"{f*100:.2f}%" if not np.isnan(f) else fallback
+    except Exception:
+        return fallback
+
+opt_period_str = _fmt_int(opt_period)
+opt_n_str      = _fmt_int(opt_n)
+target_n_str   = _fmt_int(target_n, opt_n_str)
+ret_str        = _fmt_pct(best_ret)
+as_of_str      = str(as_of) if as_of else "—"
 
 # Holdings already filtered and sorted by load_holdings_and_config
 holdings    = latest_wts
@@ -356,11 +373,11 @@ pill = (
     "margin-right:10px;display:inline-block;margin-bottom:6px"
 )
 config_html = (
-    f'<span style="{pill}">⏱ Hold {opt_period}d</span>'
-    f'<span style="{pill}">📦 Target {target_n} ETF(s) · Actual {opt_n}</span>'
+    f'<span style="{pill}">⏱ Hold {opt_period_str}d</span>'
+    f'<span style="{pill}">📦 Target {target_n_str} ETF(s) · Actual {opt_n_str}</span>'
     f'<span style="{pill}">{method_emoji} {method_label}</span>'
     f'<span style="{pill}">📈 {ret_str} best ann. return (trailing 252d)</span>'
-    f'<span style="{pill}">📅 Signals as of {as_of}</span>'
+    f'<span style="{pill}">📅 Signals as of {as_of_str}</span>'
 )
 
 action_html = f"""
