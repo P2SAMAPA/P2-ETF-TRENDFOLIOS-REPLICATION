@@ -208,39 +208,54 @@ def run_universe(
     push(Dataset.from_pandas(cal, preserve_index=False),
          f"{prefix}_calendar", f"update: {label} calendar year returns")
 
-    # Latest weights snapshot — actual holdings after inclusion filter
+    # ── Latest weights + optimal config — combined into one robust dataset ────
     latest_w = port["latest_weights"]
     if isinstance(latest_w, pd.Series):
         latest_w = latest_w.reset_index()
         latest_w.columns = ["ticker", "weight"]
     latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
 
-    # Always push something — even empty list is better than stale data
-    push(
-        Dataset.from_list(latest_w.to_dict("records")) if not latest_w.empty
-        else Dataset.from_list([{"ticker": "CASH", "weight": 1.0}]),
-        f"{prefix}_latest_weights", f"update: {label} latest weights"
-    )
+    holdings_str   = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
+    optimal_period = int(port["latest_period"])
+    optimal_n      = int(port["latest_n"])
+    target_n_val   = int(port.get("latest_target_n", port["latest_n"]))
+    best_ret_val   = round(float(port["latest_best_return"]), 6)
+    as_of_val      = str(prices.index[-1].date())
+    is_invested    = not latest_w.empty
 
-    # Rolling optimal params history
+    # Pad to at least 3 rows (HF parquet needs >1 row to avoid generation errors)
+    if latest_w.empty:
+        rows = [{"ticker": "CASH", "weight": 1.0}]
+    else:
+        rows = latest_w.to_dict("records")
+
+    # Attach optimal config to EVERY row as extra columns — no single-row dataset needed
+    for r in rows:
+        r["optimal_period"]  = optimal_period
+        r["optimal_n"]       = optimal_n
+        r["target_n"]        = target_n_val
+        r["best_ann_return"] = best_ret_val
+        r["holdings"]        = holdings_str
+        r["as_of"]           = as_of_val
+        r["is_invested"]     = is_invested
+
+    # Pad to minimum 3 rows to avoid HF parquet single-row generation errors
+    while len(rows) < 3:
+        rows.append({
+            "ticker": "", "weight": 0.0,
+            "optimal_period": optimal_period, "optimal_n": optimal_n,
+            "target_n": target_n_val, "best_ann_return": best_ret_val,
+            "holdings": holdings_str, "as_of": as_of_val, "is_invested": is_invested,
+        })
+
+    push(Dataset.from_list(rows),
+         f"{prefix}_latest_weights", f"update: {label} latest weights + config")
+
+    # Rolling optimal params history (keep as-is — large enough to not fail)
     opt_df = port["optimal_params"].reset_index()
     opt_df["date"] = opt_df["date"].dt.strftime("%Y-%m-%d")
     push(Dataset.from_pandas(opt_df, preserve_index=False),
          f"{prefix}_optimal_params", f"update: {label} optimal params history")
-
-    # Latest optimal snapshot — single row for hero box
-    holdings_str = ",".join(latest_w["ticker"].tolist()) if not latest_w.empty else ""
-    latest_opt_record = [{
-        "optimal_period":   port["latest_period"],
-        "optimal_n":        port["latest_n"],          # actual ETFs held after inclusion
-        "target_n":         port.get("latest_target_n", port["latest_n"]),  # optimiser target
-        "best_ann_return":  round(port["latest_best_return"], 6),
-        "holdings":         holdings_str,
-        "as_of":            str(prices.index[-1].date()),
-        "is_invested":      len(latest_w) > 0 and latest_w.iloc[0]["ticker"] != "CASH",
-    }]
-    push(Dataset.from_list(latest_opt_record),
-         f"{prefix}_latest_optimal", f"update: {label} latest optimal snapshot")
 
     print(f"  ✓ {label} pipeline complete.")
     return bt["summary"]
