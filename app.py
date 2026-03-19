@@ -118,6 +118,7 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
                 "as_of":           str(opt_df.index[-1].date()),
                 "is_invested":     len(holdings) > 0,
                 "inception_year":  inception_year,
+                "optimal_method":  str(last_opt.get("optimal_method", "inv_te")),
             }
     except Exception as e:
         st.warning(f"Could not load {prefix}_optimal_params: {e}")
@@ -267,6 +268,9 @@ target_n    = _safe(latest_opt.get("target_n"),        lambda v: f"{int(float(v)
 best_ret    = latest_opt.get("best_ann_return")
 as_of       = _safe(latest_opt.get("as_of"))
 ret_str     = _safe(best_ret, lambda v: f"{float(v)*100:.2f}%")
+raw_method  = latest_opt.get("optimal_method", "inv_te")
+method_label = "Inverse-TE weighting" if raw_method == "inv_te" else "Momentum-rank weighting"
+method_emoji = "⚖️" if raw_method == "inv_te" else "🚀"
 
 # Holdings already filtered and sorted by load_holdings_and_config
 holdings    = latest_wts
@@ -304,6 +308,7 @@ pill = (
 config_html = (
     f'<span style="{pill}">⏱ Hold {opt_period}d</span>'
     f'<span style="{pill}">📦 Target {target_n} ETF(s) · Actual {opt_n}</span>'
+    f'<span style="{pill}">{method_emoji} {method_label}</span>'
     f'<span style="{pill}">📈 {ret_str} best ann. return (trailing 252d)</span>'
     f'<span style="{pill}">📅 Signals as of {as_of}</span>'
 )
