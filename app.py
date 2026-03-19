@@ -80,16 +80,55 @@ def load(config: str) -> pd.DataFrame:
 @st.cache_data(ttl=900)
 def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
     """
-    Derives current holdings and optimal config from two large reliable datasets:
-    - {prefix}_weights      : full weight history → last row = current weights
-    - {prefix}_optimal_params : full optimiser history → last row = current config
+    Reads EVERYTHING from {prefix}_weights — the one large reliable dataset.
 
-    Avoids the small-parquet HF generation error that plagues latest_weights.
+    The pipeline embeds optimal config columns on every row of this dataset,
+    so the last row gives us both current holdings AND the optimal config.
+
+    Columns expected: ticker, weight, optimal_period, optimal_n, target_n,
+                      optimal_method, best_ann_return, as_of, is_invested,
+                      inception_year
     """
-    holdings = pd.DataFrame(columns=["ticker", "weight"])
-    opt      = {}
+    holdings       = pd.DataFrame(columns=["ticker", "weight"])
+    opt            = {}
+    inception_year = 2005 if prefix == "equity" else 2007
 
-    # ── Current weights from last row of full weights dataset ─────────────────
+    try:
+        # ── Try latest_weights first (has embedded config, smaller/faster) ────
+        config = f"{prefix}_latest_weights"
+        split  = _get_split(config)
+        ds     = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
+        df     = ds.to_pandas()
+
+        if not df.empty and "ticker" in df.columns:
+            # Extract real holdings (non-padding rows)
+            real = df[
+                (df["weight"] > 1e-6) &
+                (df["ticker"].str.strip() != "") &
+                (df["ticker"] != "CASH")
+            ].sort_values("weight", ascending=False)
+
+            if not real.empty:
+                holdings = real[["ticker", "weight"]].copy()
+
+            # Extract config from first row (all rows have same config values)
+            first = df.iloc[0]
+            opt = {
+                "optimal_period":  _coerce_int(first.get("optimal_period"), 0),
+                "optimal_n":       len(holdings),
+                "target_n":        _coerce_int(first.get("target_n"), len(holdings)),
+                "optimal_method":  str(first.get("optimal_method", "inv_te")),
+                "best_ann_return": _coerce_float(first.get("best_ann_return")),
+                "as_of":           str(first.get("as_of", "")),
+                "is_invested":     len(holdings) > 0,
+                "inception_year":  _coerce_int(first.get("inception_year"), inception_year),
+            }
+            return holdings, opt
+
+    except Exception:
+        pass  # Fall through to weights dataset
+
+    # ── Fallback: derive from large weights dataset (always works) ────────────
     try:
         weights_df = load(f"{prefix}_weights")
         if not weights_df.empty:
@@ -101,29 +140,36 @@ def load_holdings_and_config(prefix: str) -> tuple[pd.DataFrame, dict]:
                     "ticker": w.index.tolist(),
                     "weight": w.values.tolist(),
                 })
-    except Exception as e:
-        st.warning(f"Could not derive holdings from {prefix}_weights: {e}")
-
-    # ── Optimal config from last row of optimal_params dataset ────────────────
-    try:
-        opt_df = load(f"{prefix}_optimal_params")
-        if not opt_df.empty:
-            last_opt = opt_df.iloc[-1]
-            inception_year = 2005 if prefix == "equity" else 2007
             opt = {
-                "optimal_period":  int(float(last_opt.get("optimal_period", 0))),
+                "optimal_period":  0,
                 "optimal_n":       len(holdings),
-                "target_n":        int(float(last_opt.get("optimal_n", 0))),
-                "best_ann_return": float(last_opt.get("best_ann_return", float("nan"))),
-                "as_of":           str(opt_df.index[-1].date()),
+                "target_n":        len(holdings),
+                "optimal_method":  "inv_te",
+                "best_ann_return": float("nan"),
+                "as_of":           as_of,
                 "is_invested":     len(holdings) > 0,
                 "inception_year":  inception_year,
-                "optimal_method":  str(last_opt.get("optimal_method", "inv_te")),
             }
     except Exception as e:
-        st.warning(f"Could not load {prefix}_optimal_params: {e}")
+        st.warning(f"Could not load {prefix}_weights: {e}")
 
     return holdings, opt
+
+
+def _coerce_int(v, default=0) -> int:
+    try:
+        f = float(v)
+        return int(f) if not np.isnan(f) and f != 0 else default
+    except Exception:
+        return default
+
+
+def _coerce_float(v) -> float:
+    try:
+        f = float(v)
+        return f if not np.isnan(f) else float("nan")
+    except Exception:
+        return float("nan")
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -262,15 +308,19 @@ def _safe(v, fmt=str, fallback="—"):
     except Exception:
         return fallback
 
-opt_period  = _safe(latest_opt.get("optimal_period"), lambda v: f"{int(float(v))}")
-opt_n       = _safe(latest_opt.get("optimal_n"),       lambda v: f"{int(float(v))}")
-target_n    = _safe(latest_opt.get("target_n"),        lambda v: f"{int(float(v))}", opt_n)
-best_ret    = latest_opt.get("best_ann_return")
-as_of       = _safe(latest_opt.get("as_of"))
-ret_str     = _safe(best_ret, lambda v: f"{float(v)*100:.2f}%")
-raw_method  = latest_opt.get("optimal_method", "inv_te")
+opt_period   = latest_opt.get("optimal_period", 0) or "—"
+opt_n        = latest_opt.get("optimal_n", 0) or "—"
+target_n     = latest_opt.get("target_n", opt_n) or opt_n
+best_ret     = latest_opt.get("best_ann_return")
+as_of        = latest_opt.get("as_of", "") or "—"
+raw_method   = latest_opt.get("optimal_method", "inv_te")
 method_label = "Inverse-TE weighting" if raw_method == "inv_te" else "Momentum-rank weighting"
 method_emoji = "⚖️" if raw_method == "inv_te" else "🚀"
+
+try:
+    ret_str = f"{float(best_ret)*100:.2f}%" if best_ret and not np.isnan(float(best_ret)) else "—"
+except Exception:
+    ret_str = "—"
 
 # Holdings already filtered and sorted by load_holdings_and_config
 holdings    = latest_wts
