@@ -90,26 +90,26 @@ def momentum_signal(prices: pd.DataFrame) -> pd.DataFrame:
     """
     Line-based momentum signal (inspired by Moskowitz et al. 2011).
     Uses relative returns across frequencies; assigns 1 if return > 0
-    for the majority of timeframes (cross-sectional rank + absolute sign).
-    Returns binary Series per ticker (1 = include, 0 = exclude).
+    for at least 1/3 of timeframes (lowered from n/2 to avoid blanket exclusion
+    in choppy/volatile markets).
+    Returns binary DataFrame per ticker (1 = include, 0 = exclude).
     """
     scores = pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
     for label, freq in FREQUENCIES.items():
         rv = normalised_returns(prices, freq)
         rv_mean = rv.rolling(window=VOL_WINDOW).mean()
-        # Positive return relative to its own mean → bullish
         scores = scores.add(rv.gt(rv_mean).astype(float), fill_value=0)
 
     n = len(FREQUENCIES)
-    # Include if positive majority across frequencies
-    return (scores >= (n / 2)).astype(int)
+    # Include if at least 1/3 of frequencies show positive momentum
+    return (scores >= max(1, n / 3)).astype(int)
 
 
 def trend_signal(prices: pd.DataFrame) -> pd.DataFrame:
     """
     Curve-based trend-following signal (inspired by Faber 2006).
     Uses spread signals across frequencies; assigns 1 if spread > 0
-    for the majority of timeframes.
+    for at least 1/3 of timeframes.
     Returns binary DataFrame (1 = in trend, 0 = not).
     """
     scores = pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
@@ -118,16 +118,19 @@ def trend_signal(prices: pd.DataFrame) -> pd.DataFrame:
         scores = scores.add(s.gt(0).astype(float), fill_value=0)
 
     n = len(FREQUENCIES)
-    return (scores >= (n / 2)).astype(int)
+    return (scores >= max(1, n / 3)).astype(int)
 
 
 def majority_vote(mom: pd.DataFrame, trend: pd.DataFrame) -> pd.DataFrame:
     """
-    Majority-of-vote fusion: include asset if BOTH momentum AND trend
-    signals agree (1,1). This is the strict inclusion criterion from the paper.
+    Majority-of-vote fusion: include asset if EITHER momentum OR trend
+    signal fires (OR logic). Strict AND was producing all-zero inclusion
+    in volatile/choppy market regimes, leaving the portfolio permanently
+    in cash. OR logic is more robust while still requiring at least one
+    directional signal to be present.
     Returns binary inclusion DataFrame.
     """
-    return ((mom == 1) & (trend == 1)).astype(int)
+    return ((mom == 1) | (trend == 1)).astype(int)
 
 
 def compute_signals(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
