@@ -232,6 +232,7 @@ def run_universe(
     optimal_period = int(port["latest_period"])
     optimal_n      = int(port["latest_n"])
     target_n_val   = int(port.get("latest_target_n", port["latest_n"]))
+    optimal_method = str(port.get("latest_method", "inv_te"))
     best_ret_val   = round(float(port["latest_best_return"]), 6)
     as_of_val      = str(prices.index[-1].date())
     is_invested    = not latest_w.empty
@@ -247,6 +248,7 @@ def run_universe(
         r["optimal_period"]  = optimal_period
         r["optimal_n"]       = optimal_n
         r["target_n"]        = target_n_val
+        r["optimal_method"]  = optimal_method
         r["best_ann_return"] = best_ret_val
         r["holdings"]        = holdings_str
         r["as_of"]           = as_of_val
@@ -258,9 +260,10 @@ def run_universe(
         rows.append({
             "ticker": "", "weight": 0.0,
             "optimal_period": optimal_period, "optimal_n": optimal_n,
-            "target_n": target_n_val, "best_ann_return": best_ret_val,
-            "holdings": holdings_str, "as_of": as_of_val,
-            "is_invested": is_invested, "inception_year": inception_year,
+            "target_n": target_n_val, "optimal_method": optimal_method,
+            "best_ann_return": best_ret_val, "holdings": holdings_str,
+            "as_of": as_of_val, "is_invested": is_invested,
+            "inception_year": inception_year,
         })
 
     push(Dataset.from_list(rows),
