@@ -249,17 +249,27 @@ def build_portfolio(
     port_ret = (weights.shift(1) * asset_rets).sum(axis=1)
     port_ret.name = "portfolio_return"
 
-    # Latest state
+    # ── Latest state — force fresh weight calc using last available signals ──
     latest_row      = opt_params.iloc[-1]
     latest_period   = int(latest_row["optimal_period"])
     latest_n        = int(latest_row["optimal_n"])
     latest_best_ret = float(latest_row["best_ann_return"])
 
-    latest_w = weights.iloc[-1]
-    latest_w = latest_w[latest_w > 0.001].sort_values(ascending=False)
+    # Recalculate weights at the very last row using today's inclusion + TE
+    # This gives "what to hold NOW" regardless of where we are in the hold cycle
+    latest_w = _inv_te_weights(
+        te.iloc[-1],
+        inclusion.iloc[-1],
+        latest_n,
+    )
+    latest_w = latest_w[latest_w > 1e-6].sort_values(ascending=False)
+
+    # Actual N is how many ETFs passed inclusion — may be less than optimal_n
+    actual_n = len(latest_w)
 
     print(f"    ✓ Latest optimal: hold={latest_period}d | "
-          f"N={latest_n} ETF(s) | ann_return={latest_best_ret*100:.2f}%")
+          f"target N={latest_n}, actual N={actual_n} (inclusion filtered) | "
+          f"ann_return={latest_best_ret*100:.2f}%")
     print(f"    ✓ Current holdings: {list(latest_w.index)}")
 
     return {
@@ -268,6 +278,7 @@ def build_portfolio(
         "latest_weights":     latest_w,
         "optimal_params":     opt_params,
         "latest_period":      latest_period,
-        "latest_n":           latest_n,
+        "latest_n":           actual_n,        # actual holdings count, not target
+        "latest_target_n":    latest_n,        # original optimiser target
         "latest_best_return": latest_best_ret,
     }
