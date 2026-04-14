@@ -2,7 +2,7 @@ name: Daily Pipeline Run
 
 on:
   schedule:
-    # Runs Mon–Fri at 22:30 UTC (after 4:00 PM ET close + 1hr buffer, runs after daily_data_update)
+    # Runs Mon–Fri at 23:30 UTC (after 4:00 PM ET close + 1hr buffer, runs after daily_data_update)
     - cron: "30 22 * * 1-5"
   workflow_dispatch:  # allow manual trigger
 
