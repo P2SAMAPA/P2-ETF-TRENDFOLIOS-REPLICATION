@@ -1,31 +1,31 @@
 """
 run_pipeline.py
----------------
+-------------
 Main pipeline: loads raw prices from HuggingFace, runs signals,
 builds portfolios, runs backtests, and pushes results back to HF.
 
 Run by GitHub Actions weekly, or locally:
-    HF_TOKEN=your_token python run_pipeline.py
+ HF_TOKEN=your_token python run_pipeline.py
 """
 
 import os
 import json
 import pandas as pd
 import numpy as np
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfApi
+from datasets import Dataset
+from huggingface_hub import HfApi, hf_hub_download
 
 import importlib
-sig_module   = importlib.import_module("signal_engine")
+sig_module = importlib.import_module("signal_engine")
 sig_module_b = importlib.import_module("signal_engine_b")
-port_module  = importlib.import_module("portfolio")
+port_module = importlib.import_module("portfolio")
 port_module_b = importlib.import_module("portfolio_b")
-bt_module    = importlib.import_module("backtest")
+bt_module = importlib.import_module("backtest")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 HF_REPO_ID = "P2SAMAPA/p2-etf-trendfolios-replication-data"
-HF_TOKEN   = os.environ.get("HF_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 EQUITY_ETFS = [
     "IWD", "IWF", "IWM", "IWO", "EFA", "EEM", "EWZ",
@@ -43,24 +43,34 @@ BENCHMARKS = {"equity": "SPY", "fixed_income": "AGG"}
 
 # Hard start dates — enforced to ensure meaningful full-universe coverage
 UNIVERSE_START = {
-    "equity":       "2005-01-01",
+    "equity": "2005-01-01",
     "fixed_income": "2007-01-01",
 }
-
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
 def load_prices() -> pd.DataFrame:
     """Load wide-format adjusted close prices from HuggingFace."""
     print("Loading prices from HuggingFace …")
-    ds = load_dataset(HF_REPO_ID, "prices", split="train", token=HF_TOKEN)
-    df = ds.to_pandas()
+    
+    # Bypass dataset metadata/schema issues by loading Parquet directly
+    # This avoids CastError from cached schema mismatches (IWN vs IWM)
+    parquet_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename="prices/train-00000-of-00001.parquet",
+        repo_type="dataset",
+        token=HF_TOKEN,
+        revision="main"
+    )
+    
+    # Read parquet directly with pandas (no dataset schema casting)
+    df = pd.read_parquet(parquet_path)
+    
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
     df.columns.name = None
-    print(f"  → {len(df)} rows, {df.shape[1]} tickers")
+    print(f" → {len(df)} rows, {df.shape[1]} tickers")
     return df
-
 
 def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
     """
@@ -69,8 +79,8 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
     """
     import yfinance as yf
 
-    last_date  = prices.index.max()
-    today      = pd.Timestamp.today().normalize()
+    last_date = prices.index.max()
+    today = pd.Timestamp.today().normalize()
 
     if last_date >= today:
         print("Prices are up to date.")
@@ -85,7 +95,7 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
         progress=False,
     )
     if new_raw.empty:
-        print("  No new data.")
+        print(" No new data.")
         return prices
 
     new_close = new_raw["Close"].copy()
@@ -94,9 +104,8 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
 
     updated = pd.concat([prices, new_close]).sort_index()
     updated = updated[~updated.index.duplicated(keep="last")]
-    print(f"  → Added {len(new_close)} new rows")
+    print(f" → Added {len(new_close)} new rows")
     return updated
-
 
 # ── Push helpers ──────────────────────────────────────────────────────────────
 
@@ -105,10 +114,9 @@ def df_to_dataset(df: pd.DataFrame, date_col: str = "date") -> Dataset:
     out = df.copy()
     if isinstance(out.index, pd.DatetimeIndex):
         out.index = out.index.strftime("%Y-%m-%d")
-        out = out.reset_index().rename(columns={"index": date_col})
+    out = out.reset_index().rename(columns={"index": date_col})
     out.columns = [str(c) for c in out.columns]
     return Dataset.from_pandas(out, preserve_index=False)
-
 
 def push(ds: Dataset, config: str, msg: str):
     ds.push_to_hub(
@@ -118,14 +126,13 @@ def push(ds: Dataset, config: str, msg: str):
         token=HF_TOKEN,
         commit_message=msg,
     )
-    print(f"  ✓ Pushed → {config}")
-
+    print(f" ✓ Pushed → {config}")
 
 # ── Per-universe pipeline ─────────────────────────────────────────────────────
 
 def _push_option_results(
     prefix: str,
-    option: str,           # "a" or "b"
+    option: str,  # "a" or "b"
     label: str,
     port: dict,
     bt: dict,
@@ -136,29 +143,29 @@ def _push_option_results(
 ):
     """Push all results for one option (A or B) to HuggingFace."""
     import json, tempfile, os as _os
-    key = f"{prefix}_{option}"   # e.g. "equity_a" or "equity_b"
+    key = f"{prefix}_{option}"  # e.g. "equity_a" or "equity_b"
 
     # Config
     latest_w = port["latest_weights"]
     if isinstance(latest_w, pd.Series):
         latest_w = latest_w.reset_index()
         latest_w.columns = ["ticker", "weight"]
-    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+        latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
 
     config_data = {
-        "option":          option.upper(),
-        "optimal_period":  int(port["latest_period"]),
-        "optimal_n":       int(port["latest_n"]),
-        "target_n":        int(port.get("latest_target_n", port["latest_n"])),
-        "optimal_method":  str(port.get("latest_method", "inv_te")),
+        "option": option.upper(),
+        "optimal_period": int(port["latest_period"]),
+        "optimal_n": int(port["latest_n"]),
+        "target_n": int(port.get("latest_target_n", port["latest_n"])),
+        "optimal_method": str(port.get("latest_method", "inv_te")),
         "best_ann_return": round(float(port["latest_best_return"]), 6),
-        "as_of":           str(prices.index[-1].date()),
-        "holdings":        ",".join(latest_w["ticker"].tolist()),
-        "inception_year":  inception_year,
-        "is_invested":     not latest_w.empty,
+        "as_of": str(prices.index[-1].date()),
+        "holdings": ",".join(latest_w["ticker"].tolist()),
+        "inception_year": inception_year,
+        "is_invested": not latest_w.empty,
     }
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                     delete=False, prefix=f"{key}_config_") as f:
+                                    delete=False, prefix=f"{key}_config_") as f:
         json.dump(config_data, f)
         tmp_path = f.name
     api = HfApi()
@@ -170,7 +177,7 @@ def _push_option_results(
         commit_message=f"update: {label} option {option.upper()} config",
     )
     _os.unlink(tmp_path)
-    print(f"  ✓ Pushed → {key}_config.json")
+    print(f" ✓ Pushed → {key}_config.json")
 
     # Weights
     push(df_to_dataset(port["weights"]),
@@ -179,8 +186,8 @@ def _push_option_results(
     # Returns
     ret_df = pd.DataFrame({
         "portfolio_gross": port["portfolio_returns"],
-        "portfolio_net":   bt["port_returns_net"],
-        "benchmark":       bench_returns,
+        "portfolio_net": bt["port_returns_net"],
+        "benchmark": bench_returns,
     })
     push(df_to_dataset(ret_df), f"{key}_returns",
          f"update: {label} option {option.upper()} returns")
@@ -188,7 +195,7 @@ def _push_option_results(
     # Growth
     growth_df = pd.DataFrame({
         "portfolio_gross": bt["growth_port"],
-        "benchmark":       bt["growth_bench"],
+        "benchmark": bt["growth_bench"],
     })
     push(df_to_dataset(growth_df), f"{key}_growth",
          f"update: {label} option {option.upper()} growth")
@@ -216,8 +223,7 @@ def _push_option_results(
     push(df_to_dataset(signals["inclusion"]),
          f"{key}_inclusion", f"update: {label} option {option.upper()} inclusion")
 
-    print(f"  ✓ {label} Option {option.upper()} push complete.")
-
+    print(f" ✓ {label} Option {option.upper()} push complete.")
 
 def run_universe(
     prices_all: pd.DataFrame,
@@ -230,37 +236,37 @@ def run_universe(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     print(f"\n{'='*60}")
-    print(f"  Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
-    print(f"  Hard start date: {start_date}")
+    print(f" Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
+    print(f" Hard start date: {start_date}")
     print(f"{'='*60}")
 
     available = [t for t in tickers if t in prices_all.columns]
-    missing   = [t for t in tickers if t not in prices_all.columns]
+    missing = [t for t in tickers if t not in prices_all.columns]
     if missing:
-        print(f"  ⚠ Missing tickers skipped: {missing}")
+        print(f" ⚠ Missing tickers skipped: {missing}")
 
     prices = prices_all[available].dropna(how="all")
-    bench  = prices_all[benchmark_ticker].dropna()
+    bench = prices_all[benchmark_ticker].dropna()
 
     common = prices.index.intersection(bench.index)
     common = common[common >= pd.Timestamp(start_date)]
     prices = prices.loc[common]
-    bench  = bench.loc[common]
+    bench = bench.loc[common]
 
     inception_year = pd.Timestamp(start_date).year
-    bench_returns  = bench.pct_change().dropna()
-    prefix_key     = "equity" if label == "equity" else "fixed_income"
+    bench_returns = bench.pct_change().dropna()
+    prefix_key = "equity" if label == "equity" else "fixed_income"
 
-    print(f"  → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
+    print(f" → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
 
     # ── Compute signals (sequential — shared base data needed) ────────────────
-    print("  Computing signals (A + B) …")
+    print(" Computing signals (A + B) …")
     signals_a = sig_module.compute_signals(prices)
     signals_b = sig_module_b.compute_signals_b(prices, bench)
 
     # ── Run optimisers + backtests + pushes IN PARALLEL ───────────────────────
     def run_option_a():
-        print(f"\n  [A] Building portfolio …")
+        print(f"\n [A] Building portfolio …")
         port = port_module.build_portfolio(
             prices=prices, inclusion=signals_a["inclusion"],
             benchmark_prices=bench,
@@ -270,11 +276,11 @@ def run_universe(
             bench_returns=bench_returns, label=label,
         )
         _push_option_results(prefix_key, "a", label, port, bt,
-                             signals_a, bench_returns, prices, inception_year)
+                            signals_a, bench_returns, prices, inception_year)
         return bt["summary"]
 
     def run_option_b():
-        print(f"\n  [B] Building portfolio …")
+        print(f"\n [B] Building portfolio …")
         port = port_module_b.build_portfolio_b(
             prices=prices, inclusion=signals_b["inclusion"],
             benchmark_prices=bench,
@@ -284,19 +290,18 @@ def run_universe(
             bench_returns=bench_returns, label=label,
         )
         _push_option_results(prefix_key, "b", label, port, bt,
-                             signals_b, bench_returns, prices, inception_year)
+                            signals_b, bench_returns, prices, inception_year)
         return bt["summary"]
 
-    print(f"\n  Running Option A + B in parallel …")
+    print(f"\n Running Option A + B in parallel …")
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_a = executor.submit(run_option_a)
         future_b = executor.submit(run_option_b)
         summary_a = future_a.result()
         summary_b = future_b.result()
 
-    print(f"\n  ✓ {label} complete — both options pushed.")
+    print(f"\n ✓ {label} complete — both options pushed.")
     return summary_a, summary_b
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -321,20 +326,20 @@ def main():
 
     def run_equity():
         return run_universe(
-            prices_all       = prices,
-            tickers          = EQUITY_ETFS,
+            prices_all = prices,
+            tickers = EQUITY_ETFS,
             benchmark_ticker = BENCHMARKS["equity"],
-            label            = "equity",
-            start_date       = UNIVERSE_START["equity"],
+            label = "equity",
+            start_date = UNIVERSE_START["equity"],
         )
 
     def run_fixed_income():
         return run_universe(
-            prices_all       = prices,
-            tickers          = FIXED_INCOME_ETFS,
+            prices_all = prices,
+            tickers = FIXED_INCOME_ETFS,
             benchmark_ticker = BENCHMARKS["fixed_income"],
-            label            = "fixed_income",
-            start_date       = UNIVERSE_START["fixed_income"],
+            label = "fixed_income",
+            start_date = UNIVERSE_START["fixed_income"],
         )
 
     print("\nRunning Equity + Fixed Income universes in parallel …")
@@ -365,7 +370,6 @@ def main():
     print(fi_summary_b.to_string())
 
     print("\n✓ All done.")
-
 
 if __name__ == "__main__":
     main()
