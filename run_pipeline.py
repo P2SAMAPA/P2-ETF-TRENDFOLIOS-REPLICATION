@@ -28,7 +28,7 @@ HF_REPO_ID = "P2SAMAPA/p2-etf-trendfolios-replication-data"
 HF_TOKEN   = os.environ.get("HF_TOKEN")
 
 EQUITY_ETFS = [
-    "IWD", "IWF", "IWN", "IWO", "EFA", "EEM", "EWZ",
+    "IWD", "IWF", "IWM", "IWO", "EFA", "EEM", "EWZ",
     "QQQ", "XLV", "XLF", "XLE", "XLI", "XLK", "XLY",
     "XLP", "XLB", "XLRE", "XLU", "XLC", "XBI", "XME",
     "XHB", "XSD", "XRT", "XAR", "XNTK",
