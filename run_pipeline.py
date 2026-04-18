@@ -12,6 +12,7 @@ import os
 import json
 import pandas as pd
 import numpy as np
+import traceback
 from datasets import Dataset
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -54,7 +55,6 @@ def load_prices() -> pd.DataFrame:
     print("Loading prices from HuggingFace …")
     
     # Bypass dataset metadata/schema issues by loading Parquet directly
-    # This avoids CastError from cached schema mismatches (IWN vs IWM)
     parquet_path = hf_hub_download(
         repo_id=HF_REPO_ID,
         filename="prices/train-00000-of-00001.parquet",
@@ -70,6 +70,7 @@ def load_prices() -> pd.DataFrame:
     df = df.set_index("date").sort_index()
     df.columns.name = None
     print(f" → {len(df)} rows, {df.shape[1]} tickers")
+    print(f" → Columns: {list(df.columns)}")
     return df
 
 def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
@@ -232,9 +233,8 @@ def run_universe(
     label: str,
     start_date: str,
 ):
-    """Run Option A and Option B in parallel for one universe."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    """Run Option A and Option B SEQUENTIALLY for one universe to avoid race conditions."""
+    
     print(f"\n{'='*60}")
     print(f" Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
     print(f" Hard start date: {start_date}")
@@ -258,47 +258,67 @@ def run_universe(
     prefix_key = "equity" if label == "equity" else "fixed_income"
 
     print(f" → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
+    print(f" → {len(prices.columns)} tickers available: {prices.columns.tolist()}")
 
     # ── Compute signals (sequential — shared base data needed) ────────────────
     print(" Computing signals (A + B) …")
-    signals_a = sig_module.compute_signals(prices)
-    signals_b = sig_module_b.compute_signals_b(prices, bench)
+    try:
+        signals_a = sig_module.compute_signals(prices)
+        print(f" ✓ Signals A computed: {signals_a['inclusion'].shape}")
+    except Exception as e:
+        print(f" ✗ Error computing signals A: {e}")
+        traceback.print_exc()
+        raise
 
-    # ── Run optimisers + backtests + pushes IN PARALLEL ───────────────────────
-    def run_option_a():
+    try:
+        signals_b = sig_module_b.compute_signals_b(prices, bench)
+        print(f" ✓ Signals B computed: {signals_b['inclusion'].shape}")
+    except Exception as e:
+        print(f" ✗ Error computing signals B: {e}")
+        traceback.print_exc()
+        raise
+
+    # ── Run Option A ─────────────────────────────────────────────────────────
+    summary_a = None
+    try:
         print(f"\n [A] Building portfolio …")
-        port = port_module.build_portfolio(
+        port_a = port_module.build_portfolio(
             prices=prices, inclusion=signals_a["inclusion"],
             benchmark_prices=bench,
         )
-        bt = bt_module.run_backtest(
-            port_returns=port["portfolio_returns"],
+        bt_a = bt_module.run_backtest(
+            port_returns=port_a["portfolio_returns"],
             bench_returns=bench_returns, label=label,
         )
-        _push_option_results(prefix_key, "a", label, port, bt,
+        _push_option_results(prefix_key, "a", label, port_a, bt_a,
                             signals_a, bench_returns, prices, inception_year)
-        return bt["summary"]
+        summary_a = bt_a["summary"]
+        print(f"\n ✓ {label} Option A complete")
+    except Exception as e:
+        print(f"\n ✗ Error in Option A: {e}")
+        traceback.print_exc()
+        raise
 
-    def run_option_b():
+    # ── Run Option B ─────────────────────────────────────────────────────────
+    summary_b = None
+    try:
         print(f"\n [B] Building portfolio …")
-        port = port_module_b.build_portfolio_b(
+        port_b = port_module_b.build_portfolio_b(
             prices=prices, inclusion=signals_b["inclusion"],
             benchmark_prices=bench,
         )
-        bt = bt_module.run_backtest(
-            port_returns=port["portfolio_returns"],
+        bt_b = bt_module.run_backtest(
+            port_returns=port_b["portfolio_returns"],
             bench_returns=bench_returns, label=label,
         )
-        _push_option_results(prefix_key, "b", label, port, bt,
+        _push_option_results(prefix_key, "b", label, port_b, bt_b,
                             signals_b, bench_returns, prices, inception_year)
-        return bt["summary"]
-
-    print(f"\n Running Option A + B in parallel …")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_a = executor.submit(run_option_a)
-        future_b = executor.submit(run_option_b)
-        summary_a = future_a.result()
-        summary_b = future_b.result()
+        summary_b = bt_b["summary"]
+        print(f"\n ✓ {label} Option B complete")
+    except Exception as e:
+        print(f"\n ✗ Error in Option B: {e}")
+        traceback.print_exc()
+        raise
 
     print(f"\n ✓ {label} complete — both options pushed.")
     return summary_a, summary_b
@@ -321,33 +341,24 @@ def main():
     print("\nPushing updated prices …")
     push(df_to_dataset(prices), "prices", "update: prices refresh")
 
-    # Run both universes in parallel
-    from concurrent.futures import ThreadPoolExecutor
+    # Run both universes SEQUENTIALLY to avoid resource contention
+    print("\nRunning Equity universe …")
+    eq_summary_a, eq_summary_b = run_universe(
+        prices_all=prices,
+        tickers=EQUITY_ETFS,
+        benchmark_ticker=BENCHMARKS["equity"],
+        label="equity",
+        start_date=UNIVERSE_START["equity"],
+    )
 
-    def run_equity():
-        return run_universe(
-            prices_all = prices,
-            tickers = EQUITY_ETFS,
-            benchmark_ticker = BENCHMARKS["equity"],
-            label = "equity",
-            start_date = UNIVERSE_START["equity"],
-        )
-
-    def run_fixed_income():
-        return run_universe(
-            prices_all = prices,
-            tickers = FIXED_INCOME_ETFS,
-            benchmark_ticker = BENCHMARKS["fixed_income"],
-            label = "fixed_income",
-            start_date = UNIVERSE_START["fixed_income"],
-        )
-
-    print("\nRunning Equity + Fixed Income universes in parallel …")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_eq = executor.submit(run_equity)
-        future_fi = executor.submit(run_fixed_income)
-        eq_summary_a, eq_summary_b = future_eq.result()
-        fi_summary_a, fi_summary_b = future_fi.result()
+    print("\nRunning Fixed Income universe …")
+    fi_summary_a, fi_summary_b = run_universe(
+        prices_all=prices,
+        tickers=FIXED_INCOME_ETFS,
+        benchmark_ticker=BENCHMARKS["fixed_income"],
+        label="fixed_income",
+        start_date=UNIVERSE_START["fixed_income"],
+    )
 
     print("\n" + "=" * 60)
     print("EQUITY — Option A Summary")
