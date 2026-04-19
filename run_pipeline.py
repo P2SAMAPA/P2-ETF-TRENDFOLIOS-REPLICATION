@@ -7,17 +7,18 @@ builds portfolios, runs backtests, and pushes results back to HF.
 Run by GitHub Actions weekly, or locally:
     HF_TOKEN=your_token python run_pipeline.py
 
-Fixes applied:
-  1. Added a _push_with_wait() helper that sleeps briefly after each push so
-     HuggingFace has time to finish generating / indexing the parquet before
-     the next push to the same repo arrives.  This prevents the
-     "An error occurred while generating the dataset" transient error that
-     Streamlit sees when it tries to read a config that was pushed while a
-     prior one was still being processed.
-  2. Increased the inter-push sleep to 5 s (configurable via HF_PUSH_SLEEP
-     env var) — long enough for HF's builder to settle on standard hardware.
-  3. Sequential A-then-B ordering is preserved (already correct) and each
-     push now waits before the next write to the same HF repo.
+Fixes applied (v3):
+  1. Config JSON now stores per-ticker weights individually under a
+     "ticker_weights" key, e.g. {"XSD": 1.0}.  This means app.py can
+     always reconstruct the full holdings card directly from the JSON
+     without depending on the weights parquet at all, which is only needed
+     for historical charts.
+
+  2. Added HF_PUSH_SLEEP (default 5 s) pause after every push so
+     HuggingFace's parquet builder has time to settle before the next
+     write to the same repo.  This prevents the transient "generating the
+     dataset" error that Streamlit sees when reading a config right after
+     a rapid-fire sequence of pushes.
 """
 
 import os
@@ -30,19 +31,16 @@ from datasets import Dataset
 from huggingface_hub import HfApi, hf_hub_download
 import importlib
 
-sig_module   = importlib.import_module("signal_engine")
-sig_module_b = importlib.import_module("signal_engine_b")
-port_module  = importlib.import_module("portfolio")
+sig_module    = importlib.import_module("signal_engine")
+sig_module_b  = importlib.import_module("signal_engine_b")
+port_module   = importlib.import_module("portfolio")
 port_module_b = importlib.import_module("portfolio_b")
-bt_module    = importlib.import_module("backtest")
+bt_module     = importlib.import_module("backtest")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-HF_REPO_ID  = "P2SAMAPA/p2-etf-trendfolios-replication-data"
-HF_TOKEN    = os.environ.get("HF_TOKEN")
-
-# FIX: Configurable sleep between pushes.  Set HF_PUSH_SLEEP=0 to disable
-# during local testing where you don't care about the Streamlit display.
+HF_REPO_ID    = "P2SAMAPA/p2-etf-trendfolios-replication-data"
+HF_TOKEN      = os.environ.get("HF_TOKEN")
 HF_PUSH_SLEEP = float(os.environ.get("HF_PUSH_SLEEP", "5"))
 
 EQUITY_ETFS = [
@@ -57,7 +55,6 @@ FIXED_INCOME_ETFS = [
 ]
 BENCHMARKS = {"equity": "SPY", "fixed_income": "AGG"}
 
-# Hard start dates — enforced to ensure meaningful full-universe coverage
 UNIVERSE_START = {
     "equity":       "2005-01-01",
     "fixed_income": "2007-01-01",
@@ -68,7 +65,6 @@ UNIVERSE_START = {
 def load_prices() -> pd.DataFrame:
     """Load wide-format adjusted close prices from HuggingFace."""
     print("Loading prices from HuggingFace …")
-    # Bypass dataset metadata/schema issues by loading Parquet directly
     parquet_path = hf_hub_download(
         repo_id=HF_REPO_ID,
         filename="prices/train-00000-of-00001.parquet",
@@ -86,10 +82,7 @@ def load_prices() -> pd.DataFrame:
 
 
 def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fetch any new trading days since last stored date and append.
-    Used in weekly GitHub Actions run.
-    """
+    """Fetch any new trading days since last stored date and append."""
     import yfinance as yf
 
     last_date = prices.index.max()
@@ -134,7 +127,7 @@ def df_to_dataset(df: pd.DataFrame, date_col: str = "date") -> Dataset:
 
 
 def push(ds: Dataset, config: str, msg: str):
-    """Push a dataset config and sleep briefly so HF can finish processing."""
+    """Push a dataset config and sleep so HF builder has time to settle."""
     ds.push_to_hub(
         HF_REPO_ID,
         config_name=config,
@@ -143,9 +136,6 @@ def push(ds: Dataset, config: str, msg: str):
         commit_message=msg,
     )
     print(f" ✓ Pushed → {config}")
-    # FIX: Give HuggingFace's parquet builder time to finish before the next
-    # push.  Without this pause, a rapid sequence of pushes to the same repo
-    # leaves some configs in a "generating" state that Streamlit cannot read.
     if HF_PUSH_SLEEP > 0:
         time.sleep(HF_PUSH_SLEEP)
 
@@ -153,7 +143,7 @@ def push(ds: Dataset, config: str, msg: str):
 
 def _push_option_results(
     prefix: str,
-    option: str,           # "a" or "b"
+    option: str,
     label: str,
     port: dict,
     bt: dict,
@@ -165,14 +155,24 @@ def _push_option_results(
     """Push all results for one option (A or B) to HuggingFace."""
     import tempfile, os as _os
 
-    key = f"{prefix}_{option}"   # e.g. "equity_a" or "equity_b"
+    key = f"{prefix}_{option}"
 
-    # Config
+    # Build latest_weights Series/DataFrame
     latest_w = port["latest_weights"]
     if isinstance(latest_w, pd.Series):
-        latest_w = latest_w.reset_index()
-        latest_w.columns = ["ticker", "weight"]
-    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+        latest_w_df = latest_w.reset_index()
+        latest_w_df.columns = ["ticker", "weight"]
+    else:
+        latest_w_df = latest_w.copy()
+    latest_w_df = latest_w_df[latest_w_df["weight"] > 1e-6].sort_values("weight", ascending=False)
+
+    # ── FIX: store per-ticker weights in the config JSON ─────────────────────
+    # This lets app.py reconstruct the holdings card directly from the JSON,
+    # without relying on the weights parquet last row (which may be stale).
+    ticker_weights = {
+        row["ticker"]: round(float(row["weight"]), 6)
+        for _, row in latest_w_df.iterrows()
+    }
 
     config_data = {
         "option":          option.upper(),
@@ -182,9 +182,10 @@ def _push_option_results(
         "optimal_method":  str(port.get("latest_method", "inv_te")),
         "best_ann_return": round(float(port["latest_best_return"]), 6),
         "as_of":           str(prices.index[-1].date()),
-        "holdings":        ",".join(latest_w["ticker"].tolist()),
+        "holdings":        ",".join(latest_w_df["ticker"].tolist()),
+        "ticker_weights":  ticker_weights,          # ← NEW: per-ticker weights
         "inception_year":  inception_year,
-        "is_invested":     not latest_w.empty,
+        "is_invested":     not latest_w_df.empty,
     }
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
@@ -202,12 +203,10 @@ def _push_option_results(
     )
     _os.unlink(tmp_path)
     print(f" ✓ Pushed → {key}_config.json")
-
-    # FIX: sleep after the JSON upload as well so HF is ready for the next write
     if HF_PUSH_SLEEP > 0:
         time.sleep(HF_PUSH_SLEEP)
 
-    # Weights
+    # Weights (full historical — used for charts, not the action card)
     push(df_to_dataset(port["weights"]),
          f"{key}_weights", f"update: {label} option {option.upper()} weights")
 
@@ -256,7 +255,7 @@ def _push_option_results(
 
 def run_universe(
     prices_all: pd.DataFrame,
-    tickers: list[str],
+    tickers: list,
     benchmark_ticker: str,
     label: str,
     start_date: str,
@@ -287,7 +286,7 @@ def run_universe(
     print(f" → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
     print(f" → {len(prices.columns)} tickers available: {prices.columns.tolist()}")
 
-    # ── Compute signals (sequential) ──────────────────────────────────────────
+    # ── Signals ───────────────────────────────────────────────────────────────
     print(" Computing signals (A + B) …")
     try:
         signals_a = sig_module.compute_signals(prices)
@@ -360,15 +359,12 @@ def main():
     print("TrendFolios — Daily Pipeline Run")
     print("=" * 60)
 
-    # Load and update prices
     prices = load_prices()
     prices = update_prices(prices)
 
-    # Push updated prices back
     print("\nPushing updated prices …")
     push(df_to_dataset(prices), "prices", "update: prices refresh")
 
-    # Run both universes SEQUENTIALLY to avoid resource contention
     print("\nRunning Equity universe …")
     eq_summary_a, eq_summary_b = run_universe(
         prices_all=prices,
