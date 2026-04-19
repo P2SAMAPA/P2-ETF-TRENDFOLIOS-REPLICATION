@@ -4,15 +4,25 @@ app.py
 TrendFolios® ETF Replication — Streamlit Dashboard
 Reads all data from HuggingFace Dataset.
 
-Fixes applied:
-  1. Removed @st.cache_data from load_holdings_and_config() to prevent
-     nested-cache issues (it internally calls the cached load() function).
-  2. Added retry logic with back-off in load() to tolerate HuggingFace's
-     transient "generating the dataset" errors that occur right after a push.
-  3. Improved warning messages to distinguish transient HF processing errors
+Fixes applied (v3):
+  1. ROOT CAUSE FIX — Holdings now read from {key}_config.json ("holdings"
+     field) rather than from the last row of the weights parquet.
+     The weights parquet stores the FULL historical weight matrix; its last
+     row reflects the last rebalance date (not today) and will be all-zeros
+     on any day that falls between two rebalance events.  The config JSON is
+     written by run_pipeline.py using latest_weights — the fresh calculation
+     at the last data date — and is the authoritative source of truth for
+     the current action card.
+
+  2. Removed @st.cache_data from load_holdings_and_config() to prevent the
+     Streamlit nested-cache serialisation bug (inner call to cached load()
+     cannot be serialised into the outer cache entry).
+
+  3. Added retry / back-off in load() for HuggingFace transient
+     "generating the dataset" errors that appear immediately after a push.
+
+  4. Improved warning messages to distinguish transient HF processing delays
      from genuine data-missing situations.
-  4. load_holdings_and_config now re-raises on non-transient errors so the
-     outer render_option() try/except can surface real problems correctly.
 """
 
 import os
@@ -39,20 +49,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* Body text */
 html, body, [class*="css"] { font-size: 17px !important; }
-/* Metric labels and values */
 [data-testid="stMetricLabel"] { font-size: 16px !important; }
 [data-testid="stMetricValue"] { font-size: 32px !important; font-weight: 700 !important; }
-/* Subheaders */
 h2, h3 { font-size: 22px !important; }
-/* Sidebar text */
 [data-testid="stSidebar"] { font-size: 15px !important; }
-/* Table text */
 table td, table th { font-size: 15px !important; }
-/* Dataframe */
 .stDataFrame { font-size: 15px !important; }
-/* Caption */
 [data-testid="stCaptionContainer"] { font-size: 15px !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -78,14 +81,11 @@ def _get_split(config: str) -> str:
         return "train"
 
 
-# FIX 1: Added retry logic with exponential back-off.
-# HuggingFace returns "An error occurred while generating the dataset" when a
-# parquet file was just pushed and the builder hasn't finished processing it.
-# Retrying after a short wait resolves this in almost all cases.
 @st.cache_data(ttl=900)
 def load(config: str) -> pd.DataFrame:
+    """Load a HuggingFace dataset config into a DataFrame, with retries."""
     last_exc = None
-    for attempt in range(4):          # up to 4 attempts
+    for attempt in range(4):
         try:
             split = _get_split(config)
             ds = load_dataset(HF_REPO_ID, config, split=split, token=HF_TOKEN)
@@ -96,44 +96,87 @@ def load(config: str) -> pd.DataFrame:
             return df
         except Exception as e:
             last_exc = e
-            is_transient = (
-                "generating the dataset" in str(e).lower()
-                or "temporarily unavailable" in str(e).lower()
-                or "500" in str(e)
-                or "503" in str(e)
-            )
+            is_transient = any(k in str(e).lower() for k in
+                               ("generating the dataset", "temporarily unavailable", "500", "503"))
             if is_transient and attempt < 3:
-                wait = 4 * (attempt + 1)   # 4 s, 8 s, 12 s
-                time.sleep(wait)
+                time.sleep(4 * (attempt + 1))   # 4 s, 8 s, 12 s
                 continue
             break
     raise last_exc
 
 
-# FIX 2: Removed @st.cache_data decorator.
-# Calling a @st.cache_data function from inside another @st.cache_data
-# function causes Streamlit to silently fail or raise obscure errors because
-# the inner cached call's result cannot be safely serialised into the outer
-# cache entry.  load() is already cached; this wrapper does not need to be.
-def load_holdings_and_config(key: str) -> tuple[pd.DataFrame, dict]:
+def _read_weights_for_tickers(key: str, tickers: list, as_of: str) -> dict:
+    """
+    Read per-ticker weights from the weights parquet for the given as_of date.
+    Returns {ticker: weight} dict.  Falls back gracefully to equal weights on
+    any error — the action card will still show the correct tickers from the
+    config JSON.
+
+    KEY FIX: We look for the row matching as_of date, or the LAST NON-ZERO
+    row for those tickers — NOT blindly the last row of the DataFrame, which
+    may be all-zeros if today is not a rebalance day.
+    """
+    try:
+        weights_df = load(f"{key}_weights")
+        if weights_df.empty:
+            return {}
+
+        target_date = pd.Timestamp(as_of) if as_of else None
+
+        # First choice: exact date match
+        if target_date is not None and target_date in weights_df.index:
+            row = weights_df.loc[target_date]
+        else:
+            # Second choice: last row where any of our tickers has weight > 0
+            relevant_cols = [t for t in tickers if t in weights_df.columns]
+            if relevant_cols:
+                nonzero_mask = (weights_df[relevant_cols] > 1e-6).any(axis=1)
+                nonzero_rows = weights_df[nonzero_mask]
+                row = nonzero_rows.iloc[-1] if not nonzero_rows.empty else weights_df.iloc[-1]
+            else:
+                row = weights_df.iloc[-1]
+
+        result = {}
+        for ticker in tickers:
+            if ticker in row.index:
+                v = pd.to_numeric(row[ticker], errors="coerce")
+                result[ticker] = float(v) if pd.notna(v) and v > 1e-6 else 0.0
+        return result
+
+    except Exception:
+        return {}
+
+
+# NOTE: Not decorated with @st.cache_data — this function calls the cached
+# load() internally, and Streamlit cannot serialise a nested cache call into
+# an outer cache entry.  load() is already cached so performance is fine.
+def load_holdings_and_config(key: str) -> tuple:
     """
     key = e.g. "equity_a", "equity_b", "fixed_income_a", "fixed_income_b"
-    - {key}_config.json : plain JSON  → config values
-    - {key}_weights     : parquet     → current holdings (last row)
+
+    Returns (holdings_df, opt_dict) where:
+      holdings_df  columns: ["ticker", "weight"]
+      opt_dict     keys:    optimal_period, optimal_n, target_n,
+                            optimal_method, best_ann_return, as_of,
+                            inception_year, is_invested
     """
     inception_year = 2005 if key.startswith("equity") else 2007
-
     holdings = pd.DataFrame(columns=["ticker", "weight"])
     opt: dict = {}
 
-    # ── Config from JSON ──────────────────────────────────────────────────────
+    # ── Primary source: config JSON ───────────────────────────────────────────
+    # This is written by run_pipeline.py from latest_weights — a fresh
+    # re-calculation at the end of the pipeline run.  It is always current
+    # and is the single source of truth for "what to hold today".
     try:
         from huggingface_hub import hf_hub_download
         import json
 
         json_path = hf_hub_download(
-            repo_id=HF_REPO_ID, filename=f"{key}_config.json",
-            repo_type="dataset", token=HF_TOKEN,
+            repo_id=HF_REPO_ID,
+            filename=f"{key}_config.json",
+            repo_type="dataset",
+            token=HF_TOKEN,
         )
         with open(json_path) as f:
             cfg = json.load(f)
@@ -148,8 +191,36 @@ def load_holdings_and_config(key: str) -> tuple[pd.DataFrame, dict]:
             "inception_year":  int(cfg.get("inception_year", inception_year)),
             "is_invested":     bool(cfg.get("is_invested", False)),
         }
+
+        # Build holdings from the "holdings" ticker string in the config JSON.
+        # This is the CORRECT list of what to hold — it comes from latest_weights
+        # not from the weights parquet last row.
+        tickers_str = cfg.get("holdings", "")
+        ticker_list = [t.strip() for t in tickers_str.split(",") if t.strip()]
+
+        if ticker_list:
+            # Fetch per-ticker weights from the parquet using the smart lookup
+            weights_map = _read_weights_for_tickers(key, ticker_list, cfg.get("as_of", ""))
+
+            # Build holdings DataFrame
+            rows = []
+            for ticker in ticker_list:
+                w = weights_map.get(ticker, 0.0)
+                rows.append({"ticker": ticker, "weight": w})
+            holdings = pd.DataFrame(rows)
+
+            # If all weights are zero (weights parquet couldn't be read or
+            # was all-zero), fall back to equal weighting — we still know
+            # the tickers from the config JSON so the action card is correct
+            if holdings["weight"].sum() < 1e-6:
+                holdings["weight"] = 1.0 / len(holdings)
+            else:
+                # Re-normalise
+                holdings["weight"] = holdings["weight"] / holdings["weight"].sum()
+
+            holdings = holdings.sort_values("weight", ascending=False).reset_index(drop=True)
+
     except Exception as e:
-        # FIX 3: Friendlier transient vs permanent error distinction.
         if "generating the dataset" in str(e).lower() or "404" in str(e):
             st.warning(
                 f"⏳ `{key}_config.json` is still being processed by HuggingFace "
@@ -157,34 +228,6 @@ def load_holdings_and_config(key: str) -> tuple[pd.DataFrame, dict]:
             )
         else:
             st.warning(f"Could not load `{key}_config.json`: {e}")
-
-    # ── Holdings from weights dataset ─────────────────────────────────────────
-    try:
-        weights_df = load(f"{key}_weights")
-        if not weights_df.empty:
-            last   = weights_df.iloc[-1]
-            as_of  = str(weights_df.index[-1].date())
-            w      = last.apply(pd.to_numeric, errors="coerce")
-            w      = w[w > 1e-6].sort_values(ascending=False)
-            if not w.empty:
-                holdings = pd.DataFrame({
-                    "ticker": w.index.tolist(),
-                    "weight": w.values.tolist(),
-                })
-            if not opt:
-                opt["as_of"]      = as_of
-                opt["optimal_n"]  = len(holdings)
-                opt["is_invested"] = len(holdings) > 0
-    except Exception as e:
-        # FIX 3: Distinguish transient HF processing errors from real failures.
-        if "generating the dataset" in str(e).lower():
-            st.warning(
-                f"⏳ `{key}_weights` is still being processed by HuggingFace "
-                f"— please refresh in ~30 seconds.  "
-                f"*(The pipeline ran successfully; this is a temporary delay.)*"
-            )
-        else:
-            st.warning(f"Could not load `{key}_weights`: {e}")
 
     return holdings, opt
 
@@ -329,13 +372,10 @@ def render_option(key: str, option_label: str, bench_label: str,
             rolling_df  = load(f"{key}_rolling")
             summary_df  = load(f"{key}_summary")
             calendar_df = load(f"{key}_calendar")
-            # FIX: load_holdings_and_config is no longer @st.cache_data —
-            # it is safe to call here because load() (which it calls internally)
-            # is already cached.
             latest_wts, latest_opt = load_holdings_and_config(key)
         except Exception as e:
             st.error(f"Could not load {option_label} data: {e}")
-            st.info("Run the pipeline first, or refresh in ~30 seconds if the pipeline just ran.")
+            st.info("Run the pipeline first, or refresh in ~30 seconds if it just ran.")
             return
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -376,15 +416,17 @@ def render_option(key: str, option_label: str, bench_label: str,
     as_of_str      = str(as_of) if as_of else "—"
 
     # ── Hero box ──────────────────────────────────────────────────────────────
-
+    # is_invested driven by config JSON flag + holdings from ticker list —
+    # NOT by the weights parquet last row (which is stale between rebalances).
+    config_says_invested = latest_opt.get("is_invested", False)
     holdings = latest_wts[
         (latest_wts["weight"] > 1e-6) &
         (latest_wts["ticker"].str.strip() != "")
     ].sort_values("weight", ascending=False) if not latest_wts.empty and "ticker" in latest_wts.columns else pd.DataFrame(columns=["ticker", "weight"])
 
-    is_invested = len(holdings) > 0
+    is_invested = config_says_invested or len(holdings) > 0
 
-    if is_invested:
+    if is_invested and len(holdings) > 0:
         card_html = ""
         for _, row in holdings.iterrows():
             card_html += f"""
@@ -432,11 +474,11 @@ def render_option(key: str, option_label: str, bench_label: str,
         si = sdf.loc["Since Inception"] if "Since Inception" in sdf.index else sdf.iloc[-1]
         st.caption(f"📅 Performance metrics: 1 Jan {inc_year} — {as_of_str}")
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric(f"Gross Return ({si_label})",   f"{float(si['Composite Gross Return'])*100:.2f}%")
-        c2.metric(f"Net Return ({si_label})",      f"{float(si['Composite Net Return'])*100:.2f}%")
-        c3.metric(f"Excess Return ({si_label})",   f"{float(si['Excess Return (gross)'])*100:+.2f}%")
-        c4.metric("Sharpe Ratio",                  f"{float(si['Composite Sharpe']):.2f}")
-        c5.metric("Info Ratio",                    f"{float(si['Information Ratio']):.2f}")
+        c1.metric(f"Gross Return ({si_label})",  f"{float(si['Composite Gross Return'])*100:.2f}%")
+        c2.metric(f"Net Return ({si_label})",     f"{float(si['Composite Net Return'])*100:.2f}%")
+        c3.metric(f"Excess Return ({si_label})",  f"{float(si['Excess Return (gross)'])*100:+.2f}%")
+        c4.metric("Sharpe Ratio",                 f"{float(si['Composite Sharpe']):.2f}")
+        c5.metric("Info Ratio",                   f"{float(si['Information Ratio']):.2f}")
     except Exception:
         pass
 
@@ -487,18 +529,18 @@ inc_year = 2005 if prefix == "equity" else 2007
 
 with tab_a:
     render_option(
-        key           = f"{prefix}_a",
-        option_label  = "Option A — TrendFolios Base",
-        bench_label   = bench_label,
-        today_label   = today_label,
+        key            = f"{prefix}_a",
+        option_label   = "Option A — TrendFolios Base",
+        bench_label    = bench_label,
+        today_label    = today_label,
         inception_year = inc_year,
     )
 
 with tab_b:
     render_option(
-        key           = f"{prefix}_b",
-        option_label  = "Option B — Enhanced",
-        bench_label   = bench_label,
-        today_label   = today_label,
+        key            = f"{prefix}_b",
+        option_label   = "Option B — Enhanced",
+        bench_label    = bench_label,
+        today_label    = today_label,
         inception_year = inc_year,
     )
