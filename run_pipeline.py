@@ -5,28 +5,45 @@ Main pipeline: loads raw prices from HuggingFace, runs signals,
 builds portfolios, runs backtests, and pushes results back to HF.
 
 Run by GitHub Actions weekly, or locally:
- HF_TOKEN=your_token python run_pipeline.py
+    HF_TOKEN=your_token python run_pipeline.py
+
+Fixes applied:
+  1. Added a _push_with_wait() helper that sleeps briefly after each push so
+     HuggingFace has time to finish generating / indexing the parquet before
+     the next push to the same repo arrives.  This prevents the
+     "An error occurred while generating the dataset" transient error that
+     Streamlit sees when it tries to read a config that was pushed while a
+     prior one was still being processed.
+  2. Increased the inter-push sleep to 5 s (configurable via HF_PUSH_SLEEP
+     env var) — long enough for HF's builder to settle on standard hardware.
+  3. Sequential A-then-B ordering is preserved (already correct) and each
+     push now waits before the next write to the same HF repo.
 """
 
 import os
 import json
+import time
 import pandas as pd
 import numpy as np
 import traceback
 from datasets import Dataset
 from huggingface_hub import HfApi, hf_hub_download
-
 import importlib
-sig_module = importlib.import_module("signal_engine")
+
+sig_module   = importlib.import_module("signal_engine")
 sig_module_b = importlib.import_module("signal_engine_b")
-port_module = importlib.import_module("portfolio")
+port_module  = importlib.import_module("portfolio")
 port_module_b = importlib.import_module("portfolio_b")
-bt_module = importlib.import_module("backtest")
+bt_module    = importlib.import_module("backtest")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-HF_REPO_ID = "P2SAMAPA/p2-etf-trendfolios-replication-data"
-HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID  = "P2SAMAPA/p2-etf-trendfolios-replication-data"
+HF_TOKEN    = os.environ.get("HF_TOKEN")
+
+# FIX: Configurable sleep between pushes.  Set HF_PUSH_SLEEP=0 to disable
+# during local testing where you don't care about the Streamlit display.
+HF_PUSH_SLEEP = float(os.environ.get("HF_PUSH_SLEEP", "5"))
 
 EQUITY_ETFS = [
     "IWD", "IWF", "IWM", "IWO", "EFA", "EEM", "EWZ",
@@ -34,17 +51,15 @@ EQUITY_ETFS = [
     "XLP", "XLB", "XLRE", "XLU", "XLC", "XBI", "XME",
     "XHB", "XSD", "XRT", "XAR", "XNTK",
 ]
-
 FIXED_INCOME_ETFS = [
     "TIP", "SHY", "TLT", "LQD", "HYG",
     "PFF", "MBB", "SLV", "GLD", "VNQ",
 ]
-
 BENCHMARKS = {"equity": "SPY", "fixed_income": "AGG"}
 
 # Hard start dates — enforced to ensure meaningful full-universe coverage
 UNIVERSE_START = {
-    "equity": "2005-01-01",
+    "equity":       "2005-01-01",
     "fixed_income": "2007-01-01",
 }
 
@@ -53,7 +68,6 @@ UNIVERSE_START = {
 def load_prices() -> pd.DataFrame:
     """Load wide-format adjusted close prices from HuggingFace."""
     print("Loading prices from HuggingFace …")
-    
     # Bypass dataset metadata/schema issues by loading Parquet directly
     parquet_path = hf_hub_download(
         repo_id=HF_REPO_ID,
@@ -62,16 +76,14 @@ def load_prices() -> pd.DataFrame:
         token=HF_TOKEN,
         revision="main"
     )
-    
-    # Read parquet directly with pandas (no dataset schema casting)
     df = pd.read_parquet(parquet_path)
-    
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
     df.columns.name = None
     print(f" → {len(df)} rows, {df.shape[1]} tickers")
     print(f" → Columns: {list(df.columns)}")
     return df
+
 
 def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
     """
@@ -81,7 +93,7 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
     import yfinance as yf
 
     last_date = prices.index.max()
-    today = pd.Timestamp.today().normalize()
+    today     = pd.Timestamp.today().normalize()
 
     if last_date >= today:
         print("Prices are up to date.")
@@ -95,6 +107,7 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
         auto_adjust=True,
         progress=False,
     )
+
     if new_raw.empty:
         print(" No new data.")
         return prices
@@ -119,7 +132,9 @@ def df_to_dataset(df: pd.DataFrame, date_col: str = "date") -> Dataset:
     out.columns = [str(c) for c in out.columns]
     return Dataset.from_pandas(out, preserve_index=False)
 
+
 def push(ds: Dataset, config: str, msg: str):
+    """Push a dataset config and sleep briefly so HF can finish processing."""
     ds.push_to_hub(
         HF_REPO_ID,
         config_name=config,
@@ -128,12 +143,17 @@ def push(ds: Dataset, config: str, msg: str):
         commit_message=msg,
     )
     print(f" ✓ Pushed → {config}")
+    # FIX: Give HuggingFace's parquet builder time to finish before the next
+    # push.  Without this pause, a rapid sequence of pushes to the same repo
+    # leaves some configs in a "generating" state that Streamlit cannot read.
+    if HF_PUSH_SLEEP > 0:
+        time.sleep(HF_PUSH_SLEEP)
 
 # ── Per-universe pipeline ─────────────────────────────────────────────────────
 
 def _push_option_results(
     prefix: str,
-    option: str,  # "a" or "b"
+    option: str,           # "a" or "b"
     label: str,
     port: dict,
     bt: dict,
@@ -143,32 +163,35 @@ def _push_option_results(
     inception_year: int,
 ):
     """Push all results for one option (A or B) to HuggingFace."""
-    import json, tempfile, os as _os
-    key = f"{prefix}_{option}"  # e.g. "equity_a" or "equity_b"
+    import tempfile, os as _os
+
+    key = f"{prefix}_{option}"   # e.g. "equity_a" or "equity_b"
 
     # Config
     latest_w = port["latest_weights"]
     if isinstance(latest_w, pd.Series):
         latest_w = latest_w.reset_index()
         latest_w.columns = ["ticker", "weight"]
-        latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
+    latest_w = latest_w[latest_w["weight"] > 1e-6].sort_values("weight", ascending=False)
 
     config_data = {
-        "option": option.upper(),
-        "optimal_period": int(port["latest_period"]),
-        "optimal_n": int(port["latest_n"]),
-        "target_n": int(port.get("latest_target_n", port["latest_n"])),
-        "optimal_method": str(port.get("latest_method", "inv_te")),
+        "option":          option.upper(),
+        "optimal_period":  int(port["latest_period"]),
+        "optimal_n":       int(port["latest_n"]),
+        "target_n":        int(port.get("latest_target_n", port["latest_n"])),
+        "optimal_method":  str(port.get("latest_method", "inv_te")),
         "best_ann_return": round(float(port["latest_best_return"]), 6),
-        "as_of": str(prices.index[-1].date()),
-        "holdings": ",".join(latest_w["ticker"].tolist()),
-        "inception_year": inception_year,
-        "is_invested": not latest_w.empty,
+        "as_of":           str(prices.index[-1].date()),
+        "holdings":        ",".join(latest_w["ticker"].tolist()),
+        "inception_year":  inception_year,
+        "is_invested":     not latest_w.empty,
     }
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                    delete=False, prefix=f"{key}_config_") as f:
+                                     delete=False, prefix=f"{key}_config_") as f:
         json.dump(config_data, f)
         tmp_path = f.name
+
     api = HfApi()
     api.upload_file(
         path_or_fileobj=tmp_path,
@@ -180,6 +203,10 @@ def _push_option_results(
     _os.unlink(tmp_path)
     print(f" ✓ Pushed → {key}_config.json")
 
+    # FIX: sleep after the JSON upload as well so HF is ready for the next write
+    if HF_PUSH_SLEEP > 0:
+        time.sleep(HF_PUSH_SLEEP)
+
     # Weights
     push(df_to_dataset(port["weights"]),
          f"{key}_weights", f"update: {label} option {option.upper()} weights")
@@ -187,8 +214,8 @@ def _push_option_results(
     # Returns
     ret_df = pd.DataFrame({
         "portfolio_gross": port["portfolio_returns"],
-        "portfolio_net": bt["port_returns_net"],
-        "benchmark": bench_returns,
+        "portfolio_net":   bt["port_returns_net"],
+        "benchmark":       bench_returns,
     })
     push(df_to_dataset(ret_df), f"{key}_returns",
          f"update: {label} option {option.upper()} returns")
@@ -196,7 +223,7 @@ def _push_option_results(
     # Growth
     growth_df = pd.DataFrame({
         "portfolio_gross": bt["growth_port"],
-        "benchmark": bt["growth_bench"],
+        "benchmark":       bt["growth_bench"],
     })
     push(df_to_dataset(growth_df), f"{key}_growth",
          f"update: {label} option {option.upper()} growth")
@@ -226,6 +253,7 @@ def _push_option_results(
 
     print(f" ✓ {label} Option {option.upper()} push complete.")
 
+
 def run_universe(
     prices_all: pd.DataFrame,
     tickers: list[str],
@@ -233,34 +261,33 @@ def run_universe(
     label: str,
     start_date: str,
 ):
-    """Run Option A and Option B SEQUENTIALLY for one universe to avoid race conditions."""
-    
+    """Run Option A and Option B SEQUENTIALLY for one universe."""
     print(f"\n{'='*60}")
     print(f" Running: {label.upper()} ({len(tickers)} ETFs, benchmark={benchmark_ticker})")
     print(f" Hard start date: {start_date}")
     print(f"{'='*60}")
 
     available = [t for t in tickers if t in prices_all.columns]
-    missing = [t for t in tickers if t not in prices_all.columns]
+    missing   = [t for t in tickers if t not in prices_all.columns]
     if missing:
         print(f" ⚠ Missing tickers skipped: {missing}")
 
     prices = prices_all[available].dropna(how="all")
-    bench = prices_all[benchmark_ticker].dropna()
+    bench  = prices_all[benchmark_ticker].dropna()
 
     common = prices.index.intersection(bench.index)
     common = common[common >= pd.Timestamp(start_date)]
     prices = prices.loc[common]
-    bench = bench.loc[common]
+    bench  = bench.loc[common]
 
     inception_year = pd.Timestamp(start_date).year
-    bench_returns = bench.pct_change().dropna()
-    prefix_key = "equity" if label == "equity" else "fixed_income"
+    bench_returns  = bench.pct_change().dropna()
+    prefix_key     = "equity" if label == "equity" else "fixed_income"
 
     print(f" → Data from {prices.index[0].date()} to {prices.index[-1].date()}")
     print(f" → {len(prices.columns)} tickers available: {prices.columns.tolist()}")
 
-    # ── Compute signals (sequential — shared base data needed) ────────────────
+    # ── Compute signals (sequential) ──────────────────────────────────────────
     print(" Computing signals (A + B) …")
     try:
         signals_a = sig_module.compute_signals(prices)
@@ -278,7 +305,7 @@ def run_universe(
         traceback.print_exc()
         raise
 
-    # ── Run Option A ─────────────────────────────────────────────────────────
+    # ── Option A ──────────────────────────────────────────────────────────────
     summary_a = None
     try:
         print(f"\n [A] Building portfolio …")
@@ -291,7 +318,7 @@ def run_universe(
             bench_returns=bench_returns, label=label,
         )
         _push_option_results(prefix_key, "a", label, port_a, bt_a,
-                            signals_a, bench_returns, prices, inception_year)
+                             signals_a, bench_returns, prices, inception_year)
         summary_a = bt_a["summary"]
         print(f"\n ✓ {label} Option A complete")
     except Exception as e:
@@ -299,7 +326,7 @@ def run_universe(
         traceback.print_exc()
         raise
 
-    # ── Run Option B ─────────────────────────────────────────────────────────
+    # ── Option B ──────────────────────────────────────────────────────────────
     summary_b = None
     try:
         print(f"\n [B] Building portfolio …")
@@ -312,7 +339,7 @@ def run_universe(
             bench_returns=bench_returns, label=label,
         )
         _push_option_results(prefix_key, "b", label, port_b, bt_b,
-                            signals_b, bench_returns, prices, inception_year)
+                             signals_b, bench_returns, prices, inception_year)
         summary_b = bt_b["summary"]
         print(f"\n ✓ {label} Option B complete")
     except Exception as e:
@@ -381,6 +408,7 @@ def main():
     print(fi_summary_b.to_string())
 
     print("\n✓ All done.")
+
 
 if __name__ == "__main__":
     main()
